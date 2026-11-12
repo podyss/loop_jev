@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loop-jev"
+version = "0.1.0"
+description = "JEV-style answer distillation and looped latent reasoning research"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "accelerate==1.11.0",
+    "datasets==3.6.0",
+    "math-verify==0.8.0",
+    "peft==0.18.1",
+    "pyarrow>=15",
+    "tqdm>=4.66",
+    "torch==2.11.0",
+    "transformers==5.21.0",
+    "vllm==0.26.0",
+]
+
+[project.scripts]
+loop-jev-evaluate = "loop_jev.evaluation.zero_shot:main"
+loop-jev-prepare-data = "loop_jev.data.prepare:main"
+loop-jev-run-ablations = "loop_jev.experiments.answer_slot_ablations:main"
+loop-jev-run-constant-lr = "loop_jev.experiments.constant_lr:main"
+loop-jev-train-answer-slot = "loop_jev.training.answer_slot_distill:main"
+loop-jev-train-answer-token = "loop_jev.training.answer_token:main"
+loop-jev-train-full-trajectory = "loop_jev.training.full_trajectory:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["loop_jev*"]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true

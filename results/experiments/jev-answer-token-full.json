@@ -1,0 +1,12 @@
+{
+  "model": "/data/zhanghaipeng/hjw/model/Qwen3-4B",
+  "train": "data/jev-mathqa/train.jsonl",
+  "epochs": 1,
+  "learning_rate": 2e-05,
+  "world_size": 4,
+  "examples": 2048,
+  "train_sha256": "7013ef9ab6ed53dfb7084100a6b90493bde4af2a51145dc2080da19e6b2de6a6",
+  "max_train_examples": 2048,
+  "objective": "cross-entropy over valid answer-letter token logits at the exact Jev answer slot",
+  "status": "complete"
+}
