@@ -34,6 +34,8 @@ After `uv sync`, categorized implementations are available through the installed
 
 The following is a small two-GPU example for Qwen3-1.7B using FSDP2 data parallelism. The product of `--tensor-parallel-size` and `--data-parallel-size` must match `torchrun --nproc_per_node`.
 
+Training defaults follow verl's FSDP2 mixed-precision policy: FP32 master parameters and Adam states, BF16 forward/backward compute, and FP32 gradient reduction and losses. The frozen teacher uses BF16. No precision flags are needed.
+
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 \
@@ -49,15 +51,18 @@ CUDA_VISIBLE_DEVICES=0,1 uv run torchrun --standalone --nproc_per_node=2 \
   --data-parallel-size 2 --seed 42
 ```
 
-The trainer refuses to write into a nonempty output directory. To evaluate answer-option probabilities without generating a rationale:
+The trainer refuses to write into a nonempty output directory. Evaluation defaults to the vLLM engine with BF16 weights/compute and FP32 answer-option probabilities. Each data-parallel worker runs one model replica on one GPU. Greedy one-token decoding is restricted to valid answer letters, preserving the existing answer-option scoring method. To evaluate without generating a rationale:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 uv run python -m loop_jev.evaluation.zero_shot \
   --model outputs/jev-ce-logits-kl \
   --input data/jev-mathqa/test.jsonl \
-  --output outputs/jev-ce-logits-kl-mathqa-test.jsonl \
-  --batch-size 8 --data-parallel-size 2 --dtype bfloat16
+  --output outputs/jev-ce-logits-kl/eval/jev-ce-logits-kl-mathqa-test.jsonl \
+  --data-parallel-size 2 \
+  --gpu-memory-utilization 0.9
 ```
+
+vLLM automatically batches each worker's requests; `--batch-size` only applies to `--backend transformers`. vLLM uses a per-GPU memory budget of `0.5`, matching verl's rollout default; override it with `--gpu-memory-utilization` (the example uses `0.9`). This fraction covers the model, runtime allocations, and KV cache on each GPU. Use `--enforce-eager` to disable compilation/CUDA graphs, or `--backend transformers` to use the previous evaluation engine. `--dtype` can explicitly override inference precision; its default is `bfloat16` even for checkpoints saved in FP32.
 
 For a fast CLI/data check without loading a model:
 

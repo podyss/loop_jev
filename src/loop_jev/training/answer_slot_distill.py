@@ -29,7 +29,10 @@ def remove_answer_disclosure(rationale):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        epilog="Precision defaults: FP32 master parameters/Adam states, BF16 compute, "
+               "FP32 gradient reduction and losses; BF16 frozen teacher.",
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--train", type=Path, default=Path("data/jev-mathqa/train.jsonl"))
     parser.add_argument("--output", type=Path, default=Path("outputs/jev-answer-slot-distill"))
@@ -40,6 +43,8 @@ def main():
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--max-train-examples", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=2.0)
+    parser.add_argument("--logit-loss-type", choices=("kl", "ce"), default="kl",
+                        help="Use KL divergence or soft-target cross-entropy for full-vocabulary logits")
     parser.add_argument("--logit-loss-weight", type=float, default=1.0)
     parser.add_argument("--hidden-loss-weight", type=float, default=0.1)
     parser.add_argument("--hidden-layer-selection", choices=("quarter", "twelve", "all"), default="twelve",
@@ -65,10 +70,31 @@ def main():
     import torch
     import torch.distributed as dist
     import torch.nn.functional as F
-    from torch.distributed.tensor import DTensor, Replicate, Shard
+    from torch.distributed.tensor import DTensor
     from torch.utils.data import DataLoader, Dataset, DistributedSampler
     from transformers import AutoModelForCausalLM, AutoTokenizer, DistributedConfig
     from tqdm.auto import tqdm
+
+    @torch.no_grad()
+    def clip_grad_norm_mixed(parameters, max_norm):
+        grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
+        if not grads:
+            return torch.zeros((), device=local_rank)
+
+        # DTensor reductions account for TP shards; ordinary parameters are TP-replicated.
+        norm_type = 2.0
+        total = 0.0
+        for grad in grads:
+            grad_norm = torch.linalg.vector_norm(grad.float(), ord=norm_type)
+            if isinstance(grad_norm, DTensor):
+                grad_norm = grad_norm.full_tensor()
+            total += float(grad_norm.item()) ** norm_type
+        total_norm = total ** (1.0 / norm_type)
+        clip_coef = min(1.0, max_norm / (total_norm + 1e-6))
+        if clip_coef < 1.0:
+            for grad in grads:
+                grad.mul_(clip_coef)
+        return torch.tensor(total_norm, device=local_rank)
 
     dist.init_process_group("nccl")
     rank = dist.get_rank()
@@ -168,6 +194,8 @@ def main():
     distributed_config = DistributedConfig(
         tp_size=args.tensor_parallel_size,
         fsdp_size=args.data_parallel_size,
+        # Match verl's FSDP2 policy: BF16 compute with FP32 gradient reduction.
+        fsdp_mixed_precision=True,
     )
 
     def capture_answer_hidden_states(model, layers):
@@ -184,30 +212,6 @@ def main():
 
             handles.append(decoder_layers[layer_index - 1].register_forward_hook(save_answer_position))
         return captures, handles
-
-    def clip_tensor_parallel_grad_norm(parameters, max_norm):
-        squared_norm = torch.zeros((), device=torch.cuda.current_device(), dtype=torch.float64)
-        for parameter in parameters:
-            gradient = parameter.grad
-            if gradient is None:
-                continue
-            if isinstance(gradient, DTensor):
-                if any(isinstance(placement, Shard) for placement in gradient.placements):
-                    squared_norm += gradient.to_local().double().square().sum()
-                elif all(isinstance(placement, Replicate) for placement in gradient.placements):
-                    if rank == 0:
-                        squared_norm += gradient.to_local().double().square().sum()
-                else:
-                    raise RuntimeError(f"Unsupported TP gradient placements: {gradient.placements}")
-            elif rank == 0:
-                squared_norm += gradient.double().square().sum()
-        dist.all_reduce(squared_norm, op=dist.ReduceOp.SUM)
-        total_norm = squared_norm.sqrt()
-        clip_factor = min(max_norm / (total_norm.item() + 1e-6), 1.0)
-        for parameter in parameters:
-            if parameter.grad is not None:
-                parameter.grad.mul_(clip_factor)
-        return total_norm
 
     use_teacher = args.logit_loss_weight > 0 or args.hidden_loss_weight > 0
     use_hidden = args.hidden_loss_weight > 0
@@ -267,6 +271,8 @@ def main():
             student_base, hidden_layers,
         )
     student = student_base
+    # from_pretrained() starts in eval mode; checkpointing requires training mode.
+    student.train()
 
     optimizer = torch.optim.AdamW(
         student.parameters(), lr=args.learning_rate, weight_decay=0.01, foreach=False,
@@ -297,7 +303,7 @@ def main():
         loader = DataLoader(
             EncodedDataset(), batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
         )
-        epoch_sums = torch.zeros(4, device=local_rank)
+        epoch_sums = torch.zeros(4, device=local_rank, dtype=torch.float32)
         progress = tqdm(
             loader, desc=f"epoch {epoch + 1}/{args.epochs}", unit="batch",
             dynamic_ncols=True, disable=rank != 0,
@@ -344,9 +350,10 @@ def main():
 
             if use_hidden:
                 student_hidden_capture.clear()
-            student_outputs = student(
-                **student_batch, logits_to_keep=1, output_hidden_states=False,
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                student_outputs = student(
+                    **student_batch, logits_to_keep=1, output_hidden_states=False,
+                )
             student_logits = student_outputs.logits[:, -1, :].float()
             option_logits = student_logits[:, candidate_ids]
             valid_options = (
@@ -359,11 +366,15 @@ def main():
             answer_loss = F.cross_entropy(option_logits, targets)
             logit_loss = answer_loss.new_zeros(())
             if args.logit_loss_weight > 0:
-                logit_loss = F.kl_div(
-                    F.log_softmax(student_logits / temperature, dim=-1),
-                    F.softmax(teacher_logits / temperature, dim=-1),
-                    reduction="batchmean",
-                ) * (temperature ** 2)
+                teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+                student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+                if args.logit_loss_type == "kl":
+                    logit_loss = F.kl_div(
+                        student_log_probs, teacher_probs, reduction="batchmean",
+                    )
+                else:
+                    logit_loss = -(teacher_probs * student_log_probs).sum(dim=-1).mean()
+                logit_loss = logit_loss * (temperature ** 2)
             hidden_losses = []
             for layer, target_hidden in zip(hidden_layers, teacher_hidden):
                 student_hidden = student_hidden_capture[layer].float()
@@ -388,7 +399,7 @@ def main():
 
             if sync_now:
                 update_step += 1
-                grad_norm = clip_tensor_parallel_grad_norm(student.parameters(), 1.0)
+                grad_norm = clip_grad_norm_mixed(student.parameters(), 1.0)
                 if not torch.isfinite(grad_norm):
                     raise FloatingPointError(f"Non-finite gradient norm at update {update_step}")
                 optimizer.step()
@@ -444,8 +455,17 @@ def main():
             "max_train_examples": args.max_train_examples,
             "max_length": args.max_length,
             "student_parameter_dtype": "float32",
+            "student_compute_dtype": "bfloat16",
+            "gradient_reduce_dtype": "float32",
+            "optimizer_state_dtype": "float32",
+            "loss_dtype": "float32",
+            "fsdp_mixed_precision": args.data_parallel_size > 1,
             "teacher_parameter_dtype": "bfloat16" if use_teacher else None,
-            "logit_distillation": "temperature-scaled KL over the full vocabulary at the next-answer-token position",
+            "logit_distillation": (
+                f"temperature-scaled {args.logit_loss_type.upper()} over the full vocabulary "
+                "at the next-answer-token position"
+            ),
+            "logit_loss_type": args.logit_loss_type,
             "temperature": temperature,
             "logit_loss_weight": args.logit_loss_weight,
             "answer_loss": "cross-entropy over valid answer-letter logits",

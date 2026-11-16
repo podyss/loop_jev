@@ -14,14 +14,15 @@ dependencies = [
     "peft==0.18.1",
     "pyarrow>=15",
     "tqdm>=4.66",
-    "torch==2.11.0",
+    "torch==2.10.0",
     "transformers==5.21.0",
-    "vllm==0.26.0",
+    "vllm==0.19.1",
 ]
 
 [project.scripts]
 loop-jev-evaluate = "loop_jev.evaluation.zero_shot:main"
 loop-jev-prepare-data = "loop_jev.data.prepare:main"
+loop-jev-generate-correct-trajectories = "loop_jev.data.generate_correct_trajectories:main"
 loop-jev-run-ablations = "loop_jev.experiments.answer_slot_ablations:main"
 loop-jev-run-constant-lr = "loop_jev.experiments.constant_lr:main"
 loop-jev-train-answer-slot = "loop_jev.training.answer_slot_distill:main"
