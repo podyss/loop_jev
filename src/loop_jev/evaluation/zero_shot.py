@@ -93,10 +93,14 @@ def score_vllm(args, rows, tokenizer, candidate_ids):
 
 def score_transformers(args, rows, tokenizer, candidate_ids):
     dtype = getattr(torch, args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
+    from loop_jev.transition import load_loop_model
+    model = load_loop_model(
         args.model, dtype=dtype, device_map={"": 0},
         attn_implementation="sdpa", trust_remote_code=False,
     ).eval()
+    if not args.disable_looping:
+        from loop_jev.looping import enable_configured_looping
+        enable_configured_looping(model, use_transition=not args.disable_transition)
     device = model.get_input_embeddings().weight.device
     rank = args._worker_rank
     desc = "Evaluating" if rank is None else f"Evaluating rank {rank}"
@@ -140,6 +144,10 @@ def main():
     parser.add_argument("--limit", type=int)
     parser.add_argument("--backend", choices=("vllm", "transformers"), default="vllm",
                         help="Inference engine")
+    parser.add_argument("--disable-looping", action="store_true",
+                        help="Run a loop-configured checkpoint with one pass through each layer")
+    parser.add_argument("--disable-transition", action="store_true",
+                        help="Bypass the transition head while retaining checkpoint looping and damping")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16",
                         help="Inference weight/compute dtype; probabilities use FP32")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5,
@@ -149,6 +157,8 @@ def main():
     parser.add_argument("--data-parallel-size", type=int, default=1)
     parser.add_argument("--_worker-rank", type=int)
     args = parser.parse_args()
+    if args.disable_transition and (args.disable_looping or args.backend != "transformers"):
+        parser.error("--disable-transition requires --backend transformers and enabled looping")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -181,6 +191,10 @@ def main():
                 ]
                 if args.enforce_eager:
                     command.append("--enforce-eager")
+                if args.disable_looping:
+                    command.append("--disable-looping")
+                if args.disable_transition:
+                    command.append("--disable-transition")
                 if args.limit is not None:
                     command.extend(["--limit", str(args.limit)])
                 worker_env = dict(os.environ)
@@ -223,6 +237,16 @@ def main():
         if not 1 <= len(row["options"]) <= 26:
             raise ValueError(f"Expected 1–26 answer options for {row['id']}")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+    from transformers import AutoConfig
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    if (getattr(config, "loop_count", 1) > 1 and not args.disable_looping
+            and args.backend == "vllm"):
+        parser.error("Looped checkpoints require --backend transformers")
+    if getattr(config, "loop_transition_rank", 0) > 0 and args.backend != "transformers":
+        parser.error("Transition checkpoints require --backend transformers, including --disable-looping")
+    if args.disable_transition and (getattr(config, "loop_transition_rank", 0) <= 0
+                                    or getattr(config, "loop_count", 1) <= 1):
+        parser.error("--disable-transition requires a checkpoint with a transition head and multiple loops")
     candidate_ids = []
     for label in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
         ids = tokenizer.encode(label, add_special_tokens=False)
@@ -243,6 +267,8 @@ def main():
             "model": args.model,
             "backend": args.backend,
             "dtype": args.dtype,
+            "disable_looping": args.disable_looping,
+            "disable_transition": args.disable_transition,
             "probability_dtype": "float32",
             "prediction_index": pred,
             "prediction_label": chr(ord("A") + pred),
