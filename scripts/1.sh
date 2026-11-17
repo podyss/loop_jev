@@ -111,7 +111,7 @@ uv run torchrun --standalone --nproc_per_node=2 \
   --module loop_jev.training.answer_slot_distill \
   --model Qwen/Qwen3-1.7B \
   --train data/gsm-mc/train.jsonl \
-  --output outputs/jev-loop3-damped-per-loop-ce-logits-kl-0.1 \
+  --output outputs/jev-loop3-damped-per-loop-ce-logits-kl-1.0 \
   --epochs 3 \
   --learning-rate 2e-6 \
   --batch-size 4 \
@@ -120,7 +120,7 @@ uv run torchrun --standalone --nproc_per_node=2 \
   --max-train-examples 1024 \
   --temperature 2.0 \
   --answer-supervision final-loop \
-  --logit-loss-weight 0.1 \
+  --logit-loss-weight 1.0 \
   --hidden-loss-weight 0.0 \
   --loop-start-layer 9 \
   --loop-end-layer 18 \
@@ -132,9 +132,9 @@ uv run torchrun --standalone --nproc_per_node=2 \
 HF_ENDPOINT=https://hf-mirror.com \
 CUDA_VISIBLE_DEVICES=0,2 \
 uv run python -m loop_jev.evaluation.zero_shot \
-  --model outputs/jev-loop3-damped-per-loop-ce-logits-kl-0.1 \
+  --model outputs/jev-loop3-damped-per-loop-ce-logits-kl-1.0 \
   --input data/gsm-mc/test.jsonl \
-  --output outputs/jev-loop3-damped-per-loop-ce-logits-kl-0.1/eval/gsm-mc-test-loop3.jsonl \
+  --output outputs/jev-loop3-damped-per-loop-ce-logits-kl-1.0/eval/gsm-mc-test-loop3.jsonl \
   --backend transformers \
   --data-parallel-size 2 \
   --disable-looping

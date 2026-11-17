@@ -1,6 +1,23 @@
 """Shared-layer looping for Qwen3 decoder models."""
 
+from contextlib import contextmanager
 from types import MethodType
+
+
+@contextmanager
+def without_looping(model):
+    """Temporarily run the normal Qwen3 forward with the same model weights."""
+    backbone = model.model
+    if ("Qwen3Model" not in type(backbone).__name__
+            or getattr(model.config, "loop_count", 1) < 2
+            or not hasattr(backbone, "_unlooped_forward")):
+        raise ValueError("without_looping requires a loop-enabled Qwen3 model")
+    looped_forward = backbone.forward
+    backbone.forward = backbone._unlooped_forward
+    try:
+        yield
+    finally:
+        backbone.forward = looped_forward
 
 
 def enable_looping(model, start_layer, end_layer, loop_count, damping=False, collect_all_readouts=True,
@@ -124,6 +141,8 @@ def enable_looping(model, start_layer, end_layer, loop_count, damping=False, col
             past_key_values=past_key_values if use_cache else None,
         )
 
+    if not hasattr(backbone, "_unlooped_forward"):
+        backbone._unlooped_forward = backbone.forward
     backbone.forward = MethodType(looped_forward, backbone)
     model.config.loop_start_layer = start_layer
     model.config.loop_end_layer = end_layer

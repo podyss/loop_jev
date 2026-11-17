@@ -39,6 +39,8 @@ def main():
                "FP32 gradient reduction and losses; BF16 frozen teacher.",
     )
     parser.add_argument("--model", required=True)
+    parser.add_argument("--loop-teacher-model", default=None,
+                        help="Use a trained looped checkpoint as teacher and keep the student non-looped")
     parser.add_argument("--train", type=Path, default=Path("data/jev-mathqa/train.jsonl"))
     parser.add_argument("--output", type=Path, default=Path("outputs/jev-answer-slot-distill"))
     parser.add_argument("--epochs", type=int, default=4)
@@ -52,7 +54,7 @@ def main():
                         help="Use KL divergence or soft-target cross-entropy for full-vocabulary logits")
     parser.add_argument("--logit-loss-weight", type=float, default=1.0)
     parser.add_argument("--process-loss-weight", type=float, default=0.0,
-                        help="Loop-wise cosine alignment to frozen teacher CoT-prefix readouts")
+                        help="Loop-wise cosine alignment to teacher CoT states, or loop-teacher states when configured")
     parser.add_argument("--process-loss-discount", type=float, default=1.0,
                         help="Geometric discount across loop anchors, in (0, 1]")
     parser.add_argument("--hidden-loss-weight", type=float, default=0.1)
@@ -80,8 +82,45 @@ def main():
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--data-parallel-size", type=int, default=1,
                         help="FSDP2 data-parallel size; TP size times DP size must equal torchrun world size")
+    parser.add_argument("--suffix-loss-weight", type=float, default=0.0,
+                        help="Single-pass layer-state suffix prediction with a frozen training-only decoder")
+    parser.add_argument("--suffix-max-tokens", type=int, default=128)
+    parser.add_argument("--progressive-text-weight", type=float, default=0.0,
+                        help="Explicit suffix LM loss with four update-based stages; direct CE+KL always active")
+    parser.add_argument("--nonloop-loss-weight", type=float, default=0.0,
+                        help="Mix a single-pass CE+KL branch into final-loop CE+KL; 0 recovers baseline")
+    parser.add_argument("--text-max-targets", type=int, default=128,
+                        help="Maximum sampled LM target positions per example; does not truncate input text")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    use_nonloop = args.nonloop_loss_weight > 0
+    if not 0 <= args.nonloop_loss_weight < 1:
+        parser.error("--nonloop-loss-weight must be in [0, 1)")
+    if use_nonloop and (args.loop_count < 2 or args.answer_supervision != "final-loop"
+                        or args.loop_teacher_model or args.transition_rank
+                        or args.process_loss_weight or args.delta_loss_weight
+                        or args.hidden_loss_weight or args.suffix_loss_weight
+                        or args.progressive_text_weight or args.tensor_parallel_size != 1):
+        parser.error("Nonloop branch requires loop-count>=2, final-loop, TP=1 and no other auxiliary modes")
+    use_text = args.progressive_text_weight > 0
+    if args.progressive_text_weight < 0 or args.text_max_targets < 1:
+        parser.error("Text weight must be nonnegative and max targets positive")
+    if use_text and (args.loop_count != 1 or args.answer_supervision != "final-loop"
+                     or args.loop_teacher_model or args.transition_rank or args.process_loss_weight
+                     or args.delta_loss_weight or args.hidden_loss_weight or args.suffix_loss_weight
+                     or args.tensor_parallel_size != 1):
+        parser.error("Progressive text requires loop-count=1, final-loop, TP=1 and no other auxiliary mode")
+    if min(args.batch_size, args.gradient_accumulation_steps, args.max_length) < 1:
+        parser.error("Batch size, accumulation and max length must be positive")
+    use_suffix = args.suffix_loss_weight > 0
+    if args.suffix_loss_weight < 0 or args.suffix_max_tokens < 1:
+        parser.error("Suffix weight must be nonnegative and token cap positive")
+    if use_suffix and (args.loop_count != 1 or args.answer_supervision != "final-loop"
+                       or args.loop_teacher_model or args.transition_rank
+                       or args.process_loss_weight or args.delta_loss_weight or args.hidden_loss_weight):
+        parser.error("Suffix prediction requires loop-count=1, final-loop, no loop teacher, transition or hidden/process/delta loss")
+    if use_suffix and args.tensor_parallel_size != 1:
+        parser.error("Suffix prediction currently supports TP=1 only")
     if args.epochs < 1:
         parser.error("--epochs must be positive")
     if min(args.logit_loss_weight, args.hidden_loss_weight, args.process_loss_weight) < 0:
@@ -90,6 +129,17 @@ def main():
         parser.error("--process-loss-discount must be in (0, 1]")
     if args.loop_count < 1:
         parser.error("--loop-count must be positive")
+    if args.loop_teacher_model and args.transition_rank:
+        parser.error("Loop-teacher distillation trains a plain non-looped student; transition heads are disabled")
+    if args.loop_teacher_model and args.answer_supervision != "final-loop":
+        parser.error("Loop-teacher distillation requires --answer-supervision final-loop")
+    if args.loop_teacher_model and args.delta_loss_weight > 0:
+        parser.error("Loop-teacher distillation uses recurrent-state alignment, not teacher-delta targets")
+    if args.loop_teacher_model and args.loop_count < 2:
+        parser.error("Loop-teacher distillation requires at least two teacher loops")
+    if args.loop_teacher_model and not any((args.logit_loss_weight, args.hidden_loss_weight,
+                                            args.process_loss_weight)):
+        parser.error("Loop-teacher distillation needs a logit, hidden, or process loss")
     if args.delta_loss_weight < 0:
         parser.error("--delta-loss-weight must be nonnegative")
     if args.delta_loss_weight > 0 and (args.transition_type != "linear-delta" or args.process_loss_weight > 0):
@@ -164,8 +214,9 @@ def main():
             raise ValueError(f"Answer label {label!r} is not one token: {ids}")
         candidate_ids.append(ids[0])
 
+    use_loop_teacher = args.loop_teacher_model is not None
     use_delta = args.delta_loss_weight > 0
-    use_process = args.process_loss_weight > 0 or use_delta
+    use_process = not use_loop_teacher and (args.process_loss_weight > 0 or use_delta)
 
     class AnswerSlotDataset(Dataset):
         def __init__(self, rows):
@@ -207,7 +258,7 @@ def main():
                     process_truncated = True
                 if not steps:
                     rationale_ids = []
-            teacher_ids = make_teacher_prefix(rationale_ids)
+            teacher_ids = student_ids if use_loop_teacher else make_teacher_prefix(rationale_ids)
             was_truncated = process_truncated or len(teacher_ids) > args.max_length
             while len(teacher_ids) > args.max_length and rationale_ids:
                 overflow = len(teacher_ids) - args.max_length
@@ -222,6 +273,15 @@ def main():
                 "target": row["gold_index"],
                 "option_count": len(row["options"]),
             }
+            if use_text:
+                from loop_jev.training.progressive_text import encode_trajectories
+                item["trajectories"] = encode_trajectories(
+                    tokenizer, prompt_ids, rationale, label_chars[row["gold_index"]], args.max_length,
+                )
+            if use_suffix:
+                from loop_jev.training.suffix_prediction import suffix_texts
+                item["suffixes"] = [tokenizer.encode(text, add_special_tokens=False)[:args.suffix_max_tokens]
+                                    for text in suffix_texts(split_reasoning_steps(rationale))]
             if use_process:
                 prefixes = make_process_prefixes(steps, args.loop_count)
                 # The final prefix is exactly the full teacher input and is reused.
@@ -250,6 +310,10 @@ def main():
             batch[f"{prefix}_attention_mask"] = torch.tensor(masks, dtype=torch.long)
         if use_process:
             batch["process_valid"] = torch.tensor([item["process_valid"] for item in examples])
+        if use_text:
+            batch["trajectories"] = [item["trajectories"] for item in examples]
+        if use_suffix:
+            batch["suffixes"] = [item["suffixes"][suffix_stage] for item in examples]
         batch["target"] = torch.tensor([item["target"] for item in examples], dtype=torch.long)
         batch["option_count"] = torch.tensor([item["option_count"] for item in examples], dtype=torch.long)
         return batch
@@ -261,6 +325,8 @@ def main():
     dataset = AnswerSlotDataset(rows)
     encoded = [dataset[index] for index in range(len(dataset))]
     truncated_examples = dataset.truncated
+    if use_suffix and not any(item["suffixes"][0] for item in encoded):
+        raise ValueError("Suffix prediction requires nonempty training rationales")
     process_statistics = None
     if use_process:
         step_counts = [item["process_step_count"] for item in encoded]
@@ -298,18 +364,42 @@ def main():
             handles.append(decoder_layers[layer_index - 1].register_forward_hook(save_answer_position))
         return captures, handles
 
-    use_teacher = args.logit_loss_weight > 0 or args.hidden_loss_weight > 0 or use_process
+    use_teacher = (args.logit_loss_weight > 0 or args.hidden_loss_weight > 0
+                   or use_process or use_loop_teacher or use_suffix)
     use_hidden = args.hidden_loss_weight > 0
     hidden_layer_count = None
     hidden_layers = None
     teacher = None
+    teacher_loop_states = []
+    teacher_loop_hook = None
     if use_teacher:
+        teacher_path = args.loop_teacher_model if use_loop_teacher else args.model
         teacher_base = AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=torch.bfloat16, attn_implementation="sdpa", trust_remote_code=False,
+            teacher_path, dtype=torch.bfloat16, attn_implementation="sdpa", trust_remote_code=False,
             distributed_config=distributed_config,
         )
         teacher_base.config.use_cache = False
         teacher_base.eval()
+        if use_loop_teacher:
+            if getattr(teacher_base.config, "loop_transition_rank", 0) != 0:
+                raise ValueError("Loop teacher checkpoint must not contain a transition head")
+            from loop_jev.looping import enable_looping
+            enable_looping(
+                teacher_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
+                damping=args.loop_damping, collect_all_readouts=False,
+            )
+            if args.process_loss_weight > 0:
+                def capture_loop_state(_module, inputs, output):
+                    previous = inputs[0][:, -1, :]
+                    block_output = output[0] if isinstance(output, (tuple, list)) else output
+                    block_output = block_output[:, -1, :]
+                    state = (previous + (block_output - previous) / args.loop_count
+                             if args.loop_damping else block_output)
+                    teacher_loop_states.append(state.detach().clone())
+
+                teacher_loop_hook = teacher_base.model.layers[
+                    args.loop_end_layer - 1
+                ].register_forward_hook(capture_loop_state)
         hidden_layer_count = teacher_base.config.num_hidden_layers
         hidden_layers = (
             list(range(1, hidden_layer_count + 1))
@@ -351,13 +441,19 @@ def main():
         args.model, config=student_config, dtype=torch.float32, attn_implementation="sdpa", trust_remote_code=False,
         distributed_config=distributed_config,
     )
-    from loop_jev.looping import enable_looping
-    enable_looping(
-        student_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
-        damping=args.loop_damping,
-        collect_all_readouts=args.answer_supervision == "every-loop" or args.process_loss_weight > 0,
-        collect_updates=use_delta,
-    )
+    if use_loop_teacher and (
+        teacher_base.config.num_hidden_layers != student_base.config.num_hidden_layers
+        or teacher_base.config.hidden_size != student_base.config.hidden_size
+    ):
+        raise ValueError("Loop teacher and student must have matching depth and hidden size")
+    if not use_loop_teacher:
+        from loop_jev.looping import enable_looping
+        enable_looping(
+            student_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
+            damping=args.loop_damping,
+            collect_all_readouts=args.answer_supervision == "every-loop" or args.process_loss_weight > 0,
+            collect_updates=use_delta,
+        )
     student_base.config.use_cache = False
     student_base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     hidden_layer_count = student_base.config.num_hidden_layers
@@ -378,6 +474,33 @@ def main():
         student_hidden_capture, student_hook_handles = capture_answer_hidden_states(
             student_base, hidden_layers,
         )
+    student_loop_capture = {}
+    student_loop_hooks = []
+    student_loop_layers = []
+    if use_loop_teacher and args.process_loss_weight > 0:
+        first = args.loop_end_layer - 1
+        remaining = hidden_layer_count - 1 - first
+        if remaining < args.loop_count - 1:
+            raise ValueError("Not enough student layers after the first loop boundary to map all teacher steps")
+        student_loop_layers = [
+            first + round(k * remaining / (args.loop_count - 1))
+            for k in range(args.loop_count)
+        ]
+        for layer_index in student_loop_layers:
+            def capture_student_step(_module, _inputs, output, index=layer_index):
+                hidden_state = output[0] if isinstance(output, (tuple, list)) else output
+                student_loop_capture[index] = hidden_state[:, -1, :].clone()
+
+            student_loop_hooks.append(
+                student_base.model.layers[layer_index].register_forward_hook(capture_student_step)
+            )
+    suffix_capture, suffix_hooks = {}, []
+    suffix_layers = []
+    if use_suffix:
+        suffix_layers = sorted({round(hidden_layer_count * f) for f in (1/3, 2/3, 1)})
+        if len(suffix_layers) != 3:
+            raise ValueError("Suffix curriculum requires at least three student layers")
+        suffix_capture, suffix_hooks = capture_answer_hidden_states(student_base, suffix_layers)
     student = student_base
     # from_pretrained() starts in eval mode; checkpointing requires training mode.
     student.train()
@@ -395,7 +518,12 @@ def main():
     batches_per_rank = math.ceil(samples_per_rank / args.batch_size)
     steps_per_epoch = math.ceil(batches_per_rank / args.gradient_accumulation_steps)
     total_steps = steps_per_epoch * args.epochs
+    if total_steps < (4 if use_text else 1):
+        raise ValueError("Not enough optimizer updates for the selected training mode")
     update_step = 0
+    text_stage_history = []
+    previous_text_stage = None
+    text_generator = torch.Generator().manual_seed(args.seed + 1000 + rank)
     completed_epochs = 0
     optimizer.zero_grad(set_to_none=True)
     temperature = args.temperature
@@ -411,6 +539,9 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     training_started = time.monotonic()
     for epoch in range(args.epochs):
+        suffix_stage = min(2, epoch * 3 // args.epochs)
+        if use_suffix and rank == 0:
+            print(f"suffix_stage={suffix_stage + 1} latent_layers={suffix_layers[:suffix_stage + 1]}", flush=True)
         sampler = DistributedSampler(
             EncodedDataset(), num_replicas=args.data_parallel_size,
             rank=rank // args.tensor_parallel_size,
@@ -420,6 +551,9 @@ def main():
         loader = DataLoader(
             EncodedDataset(), batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
         )
+        epoch_nonloop_sums = torch.zeros(2, device=local_rank, dtype=torch.float32)
+        epoch_text_sum = torch.zeros((), device=local_rank)
+        epoch_suffix_sum = torch.zeros((), device=local_rank)
         epoch_sums = torch.zeros(6, device=local_rank, dtype=torch.float32)
         progress = tqdm(
             loader, desc=f"epoch {epoch + 1}/{args.epochs}", unit="batch",
@@ -428,6 +562,17 @@ def main():
         for batch_index, batch in enumerate(progress):
             targets = batch.pop("target").to(local_rank)
             option_counts = batch.pop("option_count").to(local_rank)
+            trajectories = batch.pop("trajectories", None)
+            text_stage = None
+            if use_text:
+                from loop_jev.training.progressive_text import curriculum_stage
+                text_stage = curriculum_stage(update_step, total_steps)
+                if text_stage != previous_text_stage:
+                    text_stage_history.append({"stage": text_stage, "first_update": update_step + 1})
+                    if rank == 0:
+                        print(f"progressive_text_stage={text_stage} first_update={update_step + 1}", flush=True)
+                    previous_text_stage = text_stage
+            suffix_sequences = batch.pop("suffixes", None)
             batch = {key: value.to(local_rank) for key, value in batch.items()}
             teacher_batch = {
                 "input_ids": batch.pop("teacher_input_ids"),
@@ -437,6 +582,8 @@ def main():
                 "input_ids": batch.pop("student_input_ids"),
                 "attention_mask": batch.pop("student_attention_mask"),
             }
+            if use_loop_teacher:
+                teacher_batch = student_batch
             accumulation_remainder = len(loader) % args.gradient_accumulation_steps
             group_size = (
                 accumulation_remainder
@@ -454,6 +601,8 @@ def main():
                 if use_hidden:
                     teacher_hidden_capture.clear()
                 with torch.no_grad():
+                    if use_loop_teacher and args.process_loss_weight > 0:
+                        teacher_loop_states.clear()
                     if use_delta:
                         initial_outputs = teacher(**student_batch, logits_to_keep=1, output_hidden_states=False)
                         teacher_process_states.append(teacher_process_capture.pop("state"))
@@ -473,6 +622,8 @@ def main():
                     teacher_outputs = teacher(
                         **teacher_batch, logits_to_keep=1, output_hidden_states=False,
                     )
+                    if use_loop_teacher and args.process_loss_weight > 0:
+                        teacher_process_states = list(teacher_loop_states)
                     if use_process:
                         teacher_process_states.append(teacher_process_capture.pop("state"))
                     if args.logit_loss_weight > 0:
@@ -484,6 +635,7 @@ def main():
                         ]
                     del teacher_outputs
 
+            suffix_capture.clear()
             if use_hidden:
                 student_hidden_capture.clear()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -500,8 +652,9 @@ def main():
                 F.softmax(teacher_logits / temperature, dim=-1)
                 if args.logit_loss_weight > 0 else None
             )
-            loop_readouts = student_base.model.loop_hidden_states
-            if args.answer_supervision == "final-loop":
+            loop_readouts = ([None] if use_loop_teacher
+                             else student_base.model.loop_hidden_states)
+            if args.answer_supervision == "final-loop" and not use_loop_teacher:
                 loop_readouts = loop_readouts[-1:]
             for loop_hidden in loop_readouts:
                 # Reuse the root forward's final logits. Re-entering a tied
@@ -541,31 +694,105 @@ def main():
             )
             process_loss = (
                 process_alignment_loss(
-                    [state[:, -1, :] for state in student_base.model.loop_hidden_states],
-                    teacher_process_states, batch["process_valid"], args.process_loss_discount,
+                    ([student_loop_capture[index] for index in student_loop_layers]
+                     if use_loop_teacher else
+                     [state[:, -1, :] for state in student_base.model.loop_hidden_states]),
+                    teacher_process_states,
+                    (torch.ones(targets.shape[0], dtype=torch.bool, device=local_rank)
+                     if use_loop_teacher else batch["process_valid"]),
+                    args.process_loss_discount,
                 ) if args.process_loss_weight > 0 else answer_loss.new_zeros(())
             )
             delta_loss = (delta_alignment_loss(student_base.model.loop_updates,
                           teacher_process_states, batch["process_valid"])
                           if use_delta else answer_loss.new_zeros(()))
+            suffix_loss = answer_loss.new_zeros(())
+            if use_suffix:
+                from loop_jev.training.suffix_prediction import suffix_prediction_loss
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    suffix_loss = suffix_prediction_loss(
+                        teacher, [suffix_capture[layer] for layer in suffix_layers[:suffix_stage + 1]],
+                        suffix_sequences, tokenizer.pad_token_id,
+                        embedding_scale=teacher.config.initializer_range,
+                    )
             loss = (
-                answer_loss + args.logit_loss_weight * logit_loss
+                args.suffix_loss_weight * suffix_loss + answer_loss + args.logit_loss_weight * logit_loss
                 + args.hidden_loss_weight * hidden_loss
                 + args.process_loss_weight * process_loss
                 + args.delta_loss_weight * delta_loss
             )
-            scaled_loss = loss / group_size
+            scaled_loss = ((1 - args.nonloop_loss_weight) if use_nonloop else 1) * loss / group_size
             if not torch.isfinite(scaled_loss):
                 raise FloatingPointError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_index + 1}")
             scaled_loss.backward()
-            student_base.model.loop_hidden_states = []
-            student_base.model.loop_updates = []
+            if not use_loop_teacher:
+                student_base.model.loop_hidden_states = []
+                student_base.model.loop_updates = []
+            student_loop_capture.clear()
+            suffix_capture.clear()
+            epoch_suffix_sum += suffix_loss.detach()
+            nonloop_answer_loss = answer_loss.new_zeros(())
+            nonloop_logit_loss = answer_loss.new_zeros(())
+            if use_nonloop:
+                from loop_jev.looping import without_looping
+                # Release loop activations before the second forward. Both
+                # branches use the same student parameters and teacher target.
+                del student_outputs
+                with without_looping(student_base), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    nonloop_outputs = student(
+                        **student_batch, logits_to_keep=1, output_hidden_states=False,
+                    )
+                nonloop_logits = nonloop_outputs.logits[:, -1, :].float()
+                nonloop_options = nonloop_logits[:, candidate_ids].masked_fill(
+                    ~valid_options, torch.finfo(nonloop_logits.dtype).min,
+                )
+                nonloop_answer_loss = F.cross_entropy(nonloop_options, targets)
+                if teacher_probs is not None:
+                    nonloop_log_probs = F.log_softmax(nonloop_logits / temperature, dim=-1)
+                    if args.logit_loss_type == "kl":
+                        nonloop_logit_loss = F.kl_div(
+                            nonloop_log_probs, teacher_probs, reduction="batchmean",
+                        )
+                    else:
+                        nonloop_logit_loss = -(teacher_probs * nonloop_log_probs).sum(dim=-1).mean()
+                    nonloop_logit_loss = nonloop_logit_loss * (temperature ** 2)
+                nonloop_loss = nonloop_answer_loss + args.logit_loss_weight * nonloop_logit_loss
+                if not torch.isfinite(nonloop_loss):
+                    raise FloatingPointError(f"Non-finite nonloop loss at epoch={epoch + 1}, batch={batch_index + 1}")
+                (args.nonloop_loss_weight * nonloop_loss / group_size).backward()
+                del nonloop_outputs, nonloop_logits, nonloop_options
+            epoch_nonloop_sums += torch.stack([
+                nonloop_answer_loss.detach(), nonloop_logit_loss.detach(),
+            ])
+            # Finish direct-answer backward before allocating text-branch activations.
+            text_loss = answer_loss.new_zeros(())
+            if not use_nonloop:
+                del student_outputs
+            del teacher_logits, teacher_hidden, teacher_process_states
+            if use_text and text_stage < 3:
+                from loop_jev.training.progressive_text import collate_trajectories, trajectory_loss
+                text_batch, text_targets, text_owners = collate_trajectories(
+                    [item[text_stage] for item in trajectories], tokenizer.pad_token_id,
+                    args.text_max_targets, local_rank, text_generator,
+                )
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    text_outputs = student(**text_batch, output_hidden_states=False)
+                text_loss = trajectory_loss(text_outputs.logits, text_targets, text_owners, len(trajectories))
+                if not torch.isfinite(text_loss):
+                    raise FloatingPointError(f"Non-finite text loss at update {update_step + 1}")
+                (args.progressive_text_weight * text_loss / group_size).backward()
+                student_base.model.loop_hidden_states = []
+                student_base.model.loop_updates = []
+                del text_outputs, text_batch, text_targets, text_owners
+            epoch_text_sum += text_loss.detach()
+            loss = ((1 - args.nonloop_loss_weight) * loss.detach()
+                    + args.nonloop_loss_weight * (nonloop_answer_loss.detach()
+                    + args.logit_loss_weight * nonloop_logit_loss.detach())
+                    + args.progressive_text_weight * text_loss.detach())
             epoch_sums += torch.stack([
                 answer_loss.detach(), logit_loss.detach(), hidden_loss.detach(), loss.detach(),
                 process_loss.detach(), delta_loss.detach(),
             ])
-            del student_outputs, teacher_logits, teacher_hidden, teacher_process_states
-
             if sync_now:
                 update_step += 1
                 grad_norm = clip_grad_norm_mixed(student.parameters(), 1.0)
@@ -581,13 +808,23 @@ def main():
                         hidden=f"{hidden_loss.item():.5f}",
                         process=f"{process_loss.item():.5f}",
                         delta=f"{delta_loss.item():.5f}",
+                        suffix=f"{suffix_loss.item():.5f}",
+                        text=f"{text_loss.item():.5f}",
+                        direct_ce=f"{nonloop_answer_loss.item():.5f}" if use_nonloop else "-",
+                        direct_kl=f"{nonloop_logit_loss.item():.5f}" if use_nonloop else "-",
                         total=f"{loss.item():.5f}",
                         lr=f"{optimizer.param_groups[0]['lr']:.8g}",
                     )
 
         progress.close()
+        dist.all_reduce(epoch_nonloop_sums)
+        dist.all_reduce(epoch_text_sum)
+        dist.all_reduce(epoch_suffix_sum)
         dist.all_reduce(epoch_sums, op=dist.ReduceOp.SUM)
         mean_losses = (epoch_sums / (len(loader) * world_size)).tolist()
+        mean_suffix_loss = (epoch_suffix_sum / (len(loader) * world_size)).item()
+        mean_text_loss = (epoch_text_sum / (len(loader) * world_size)).item()
+        mean_nonloop = (epoch_nonloop_sums / (len(loader) * world_size)).tolist()
         completed_epochs = epoch + 1
         peak_memory = torch.tensor([
             torch.cuda.max_memory_allocated() / 2**30,
@@ -596,11 +833,14 @@ def main():
         dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
         training_history.append(dict(zip(
             ("ce", "kl", "hidden", "total", "process", "delta"), mean_losses,
-        ), epoch=completed_epochs,
+        ), epoch=completed_epochs, suffix=mean_suffix_loss, text=mean_text_loss,
+            nonloop_ce=mean_nonloop[0], nonloop_kl=mean_nonloop[1],
             peak_allocated_gib=peak_memory[0].item(), peak_reserved_gib=peak_memory[1].item()))
         if rank == 0:
             print(
-                f"epoch={epoch + 1} mean_ce={mean_losses[0]:.6f} "
+                f"text={mean_text_loss:.6f} suffix={mean_suffix_loss:.6f} epoch={epoch + 1} "
+                f"mean_nonloop_ce={mean_nonloop[0]:.6f} mean_nonloop_kl={mean_nonloop[1]:.6f} "
+                f"mean_ce={mean_losses[0]:.6f} "
                 f"mean_kl={mean_losses[1]:.6f} mean_hidden={mean_losses[2]:.6f} "
                 f"mean_total={mean_losses[3]:.6f} mean_process={mean_losses[4]:.6f} "
                 f"mean_delta={mean_losses[5]:.6f} "
@@ -623,7 +863,7 @@ def main():
             "loop_start_layer": args.loop_start_layer,
             "loop_end_layer": args.loop_end_layer,
             "loop_count": args.loop_count,
-            "loop_parameter_sharing": True,
+            "loop_parameter_sharing": True if not use_loop_teacher else None,
             "loop_damping": args.loop_damping,
             "transition_type": args.transition_type,
             "delta_loss_weight": args.delta_loss_weight,
@@ -635,7 +875,8 @@ def main():
                 if args.transition_type == "linear-delta" else
                 "between loops, after damped update; shared; zero-initialized output")
                 if args.transition_rank else None,
-            "teacher": args.model if use_teacher else None,
+            "teacher": (args.loop_teacher_model if use_loop_teacher else args.model)
+            if use_teacher else None,
             "train": str(args.train),
             "epochs": args.epochs,
             "completed_epochs": completed_epochs,
@@ -679,8 +920,12 @@ def main():
                 else "mean cross-entropy over valid answer-letter logits at every loop readout"
             ),
             "answer_supervision": args.answer_supervision,
+            "nonloop_loss_weight": args.nonloop_loss_weight,
+            "nonloop_objective": "same question-only input and full-rationale teacher target as final-loop; weighted CE+KL mixture, sequential backward" if use_nonloop else None,
             "student_input": "question and options only, followed by Answer: (",
-            "teacher_input": "question, options, and full training rationale, followed by Answer: (",
+            "teacher_input": ("question and options only, followed by Answer: (; recurrent loop teacher"
+                              if use_loop_teacher else
+                              "question, options, and full training rationale, followed by Answer: ("),
             "hidden_distillation": "cross-context cosine alignment at the next-answer-token position for evenly spaced transformer layers",
             "hidden_layers_1_indexed": hidden_layers,
             "hidden_layer_selection": args.hidden_layer_selection,
@@ -688,12 +933,25 @@ def main():
             "process_loss_weight": args.process_loss_weight,
             "process_loss_discount": args.process_loss_discount,
             "process_distillation": (
+                "cosine alignment of each damped recurrent-block answer-slot state to "
+                "student answer-slot outputs at evenly spaced deeper layers; weighted mean"
+                if use_loop_teacher and args.process_loss_weight > 0 else
                 "cosine alignment of each loop's final-normalized answer-slot state to "
                 "a frozen teacher reading ceil(k * N / K) complete rationale steps; "
                 "line boundaries with sentence fallback; final anchor reuses full teacher; "
                 "empty rationales masked; weighted mean over loops and valid examples"
                 if use_process else None
             ),
+            "progressive_text_weight": args.progressive_text_weight,
+            "text_max_targets": args.text_max_targets,
+            "text_stage_history": text_stage_history,
+            "text_objective": "Per-example token-mean CE on explicit rationale suffix and answer, uniform target subsampling; full/last 2 thirds/last third/none in four update quarters; direct CE+KL always active; sequential backward" if use_text else None,
+            "suffix_loss_weight": args.suffix_loss_weight,
+            "suffix_max_tokens": args.suffix_max_tokens,
+            "suffix_layers_1_indexed": suffix_layers,
+            "suffix_curriculum": "1/2/3 depth states predict full/final two thirds/final third of steps; no optimizer reset" if use_suffix else None,
+            "student_inference": "single non-looped forward pass" if use_loop_teacher or use_suffix or use_text else None,
+            "loop_teacher_student_layers_0_indexed": student_loop_layers if use_loop_teacher else None,
             "process_statistics": process_statistics,
             "truncated_examples": truncated_examples,
             "max_grad_norm": 1.0,
