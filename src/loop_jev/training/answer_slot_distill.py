@@ -11,6 +11,7 @@ import re
 import time
 from pathlib import Path
 
+from loop_jev.training.loop_cot import add_workspace_readout, round_targets, token_loss
 from loop_jev.training.process_anchors import (
     delta_alignment_loss, make_process_prefixes, process_alignment_loss, split_reasoning_steps,
 )
@@ -68,6 +69,8 @@ def main():
                         help="Number of shared-parameter passes through the recurrent block")
     parser.add_argument("--loop-damping", action=argparse.BooleanOptionalAction, default=True,
                         help="Interpolate each recurrent update by 1 / loop count")
+    parser.add_argument("--loop-carry-workspace", action="store_true",
+                        help="Carry only the latent workspace between recurrent rounds")
     parser.add_argument("--transition-rank", type=int, default=0,
                         help="Shared residual transition bottleneck width; 0 disables it")
     parser.add_argument("--transition-type", choices=("mlp", "linear-delta"), default="mlp")
@@ -89,10 +92,55 @@ def main():
                         help="Explicit suffix LM loss with four update-based stages; direct CE+KL always active")
     parser.add_argument("--nonloop-loss-weight", type=float, default=0.0,
                         help="Mix a single-pass CE+KL branch into final-loop CE+KL; 0 recovers baseline")
+    parser.add_argument("--latent-slots", type=int, default=0,
+                        help="Number of question-only latent workspace positions before the answer slot")
+    parser.add_argument("--kv-loss-weight", type=float, default=0.0,
+                        help="Align final-loop workspace K/V to offline rationale targets")
+    parser.add_argument("--kv-layer", type=int, default=17,
+                        help="Zero-based decoder layer for compressed rationale KV supervision")
+    parser.add_argument("--kv-cache", type=Path, default=None,
+                        help="Offline targets from loop_jev.training.latent_kv")
+    parser.add_argument("--loop-cot-weight", type=float, default=0.0)
+    parser.add_argument("--loop-cot-order", choices=("ordered", "shuffled"), default="ordered")
+    parser.add_argument("--loop-cot-tokens", type=int, default=8,
+                        help="Maximum supervised CoT tokens per round, read from the last latent slots")
+    parser.add_argument("--workspace-query-weight", type=float, default=0.0,
+                        help="Weight for training-only readout of intermediate quantities from workspace slots")
     parser.add_argument("--text-max-targets", type=int, default=128,
                         help="Maximum sampled LM target positions per example; does not truncate input text")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    use_kv = args.kv_loss_weight > 0
+    use_loop_cot = args.loop_cot_weight > 0
+    use_query = args.workspace_query_weight > 0
+    if not math.isfinite(args.workspace_query_weight) or args.workspace_query_weight < 0:
+        parser.error("Workspace query weight must be finite and nonnegative")
+    if use_query and (not args.latent_slots or args.answer_supervision != "final-loop"
+                      or args.tensor_parallel_size != 1 or use_kv or use_loop_cot
+                      or args.loop_carry_workspace):
+        parser.error("Workspace query requires latent slots, final-loop, TP=1 and no other workspace mode")
+    if args.loop_carry_workspace and (args.latent_slots < 1 or args.loop_count < 2
+                                     or args.loop_teacher_model or args.transition_rank):
+        parser.error("Workspace carry requires latent slots, multiple rounds, and no loop teacher or transition")
+    if not math.isfinite(args.loop_cot_weight) or args.loop_cot_weight < 0:
+        parser.error("CoT weight must be finite and nonnegative")
+    if use_loop_cot and (not 0 < args.loop_cot_tokens <= args.latent_slots or args.loop_count != 3
+                         or args.answer_supervision != "final-loop" or use_kv
+                         or args.tensor_parallel_size != 1):
+        parser.error("Loop CoT needs usable latent slots, three loops, final-loop, TP=1 and no KV loss")
+    if args.latent_slots < 0 or args.kv_loss_weight < 0:
+        parser.error("Latent slots and KV loss weight must be nonnegative")
+    if use_kv and (args.latent_slots < 1 or args.kv_cache is None or args.answer_supervision != "final-loop"
+                   or args.loop_teacher_model or args.process_loss_weight or args.hidden_loss_weight
+                   or args.delta_loss_weight or args.transition_rank or args.tensor_parallel_size != 1):
+        parser.error("KV supervision requires slots, cache, final-loop, TP=1 and no other state losses or transition")
+    if args.kv_cache is not None and not use_kv:
+        parser.error("--kv-cache requires --kv-loss-weight > 0")
+    if args.latent_slots and (args.loop_teacher_model or args.suffix_loss_weight
+                              or args.progressive_text_weight or args.nonloop_loss_weight
+                              or args.process_loss_weight or args.delta_loss_weight
+                              or args.transition_rank or args.hidden_loss_weight):
+        parser.error("Latent slots support direct CE/KL with optional KV or loop CoT supervision")
     use_nonloop = args.nonloop_loss_weight > 0
     if not 0 <= args.nonloop_loss_weight < 1:
         parser.error("--nonloop-loss-weight must be in [0, 1)")
@@ -239,7 +287,11 @@ def main():
             rationale = remove_answer_disclosure(row.get("rationale", ""))
             rationale_ids = tokenizer.encode(rationale, add_special_tokens=False)
 
-            student_ids = prompt_ids + tokenizer.encode("Answer: (", add_special_tokens=False)
+            if args.latent_slots:
+                from loop_jev.training.latent_kv import append_workspace
+                student_ids = append_workspace(prompt_ids, tokenizer, args.latent_slots)
+            else:
+                student_ids = prompt_ids + tokenizer.encode("Answer: (", add_special_tokens=False)
 
             def make_teacher_prefix(reason_ids):
                 reason = tokenizer.decode(reason_ids, skip_special_tokens=True).strip()
@@ -273,6 +325,16 @@ def main():
                 "target": row["gold_index"],
                 "option_count": len(row["options"]),
             }
+            if use_kv:
+                item["id"] = row["id"]
+            if use_loop_cot:
+                item["loop_cot_targets"] = round_targets(
+                    rationale_ids, args.loop_cot_tokens, order=args.loop_cot_order,
+                    row_id=row["id"], seed=args.seed,
+                )
+            if use_query:
+                from loop_jev.training.workspace_query import encode_queries
+                item["query_ids"], item["query_targets"] = encode_queries(tokenizer, rationale)
             if use_text:
                 from loop_jev.training.progressive_text import encode_trajectories
                 item["trajectories"] = encode_trajectories(
@@ -314,6 +376,13 @@ def main():
             batch["trajectories"] = [item["trajectories"] for item in examples]
         if use_suffix:
             batch["suffixes"] = [item["suffixes"][suffix_stage] for item in examples]
+        if use_kv:
+            batch["kv_ids"] = [item["id"] for item in examples]
+        if use_loop_cot:
+            batch["loop_cot_targets"] = torch.tensor([item["loop_cot_targets"] for item in examples])
+        if use_query:
+            for key in ("query_ids", "query_targets"):
+                batch[key] = torch.tensor([item[key] for item in examples], dtype=torch.long)
         batch["target"] = torch.tensor([item["target"] for item in examples], dtype=torch.long)
         batch["option_count"] = torch.tensor([item["option_count"] for item in examples], dtype=torch.long)
         return batch
@@ -324,7 +393,25 @@ def main():
         rows = [rows[index] for index in selection]
     dataset = AnswerSlotDataset(rows)
     encoded = [dataset[index] for index in range(len(dataset))]
+    kv_targets = None
+    if use_kv:
+        from loop_jev.training.latent_kv import load_cache
+        kv_targets = load_cache(
+            args.kv_cache, train=args.train, model=args.model, slots=args.latent_slots,
+            layer=args.kv_layer, max_length=args.max_length, seed=args.seed,
+            selected_ids=[item["id"] for item in encoded],
+        )
     truncated_examples = dataset.truncated
+    query_coverage = None
+    if use_query:
+        query_coverage = sum(any(any(ids) for ids in item["query_ids"]) for item in encoded)
+        if not query_coverage:
+            raise ValueError("Workspace query supervision requires annotated intermediate quantities")
+        if rank == 0:
+            print(f"workspace_query_coverage={query_coverage}/{len(encoded)}", flush=True)
+    if use_loop_cot and not any(token >= 0 for item in encoded
+                                for segment in item["loop_cot_targets"] for token in segment):
+        raise ValueError("Loop CoT supervision requires nonempty rationale targets")
     if use_suffix and not any(item["suffixes"][0] for item in encoded):
         raise ValueError("Suffix prediction requires nonempty training rationales")
     process_statistics = None
@@ -448,15 +535,40 @@ def main():
         raise ValueError("Loop teacher and student must have matching depth and hidden size")
     if not use_loop_teacher:
         from loop_jev.looping import enable_looping
+        workspace_slice = None
+        if use_loop_cot:
+            workspace_slice, _cot_hook = add_workspace_readout(
+                student_base, args.loop_cot_tokens,
+                len(tokenizer.encode("Answer: (", add_special_tokens=False)),
+            )
+        if use_query:
+            suffix = len(tokenizer.encode("Answer: (", add_special_tokens=False))
+            workspace_slice = slice(-args.latent_slots - suffix, -suffix)
         enable_looping(
             student_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
             damping=args.loop_damping,
             collect_all_readouts=args.answer_supervision == "every-loop" or args.process_loss_weight > 0,
             collect_updates=use_delta,
+            workspace_slice=workspace_slice,
+            carry_workspace=(args.latent_slots, len(tokenizer.encode("Answer: (", add_special_tokens=False)))
+            if args.loop_carry_workspace else None,
         )
     student_base.config.use_cache = False
     student_base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     hidden_layer_count = student_base.config.num_hidden_layers
+    if args.latent_slots:
+        from loop_jev.training.latent_kv import marker_token_id
+        student_base.config.latent_slots = args.latent_slots
+        student_base.config.latent_marker_token_id = marker_token_id(tokenizer)
+    if use_kv and not 0 <= args.kv_layer < hidden_layer_count:
+        raise ValueError("kv-layer is outside the student decoder")
+    kv_capture, kv_hooks = {}, []
+    if use_kv:
+        from loop_jev.training.latent_kv import capture_workspace_kv
+        kv_capture, kv_hooks = capture_workspace_kv(
+            student_base, args.kv_layer, args.latent_slots,
+            len(tokenizer.encode("Answer: (", add_special_tokens=False)),
+        )
     if hidden_layers is None:
         hidden_layers = (
             list(range(1, hidden_layer_count + 1))
@@ -510,9 +622,17 @@ def main():
     base_parameters = [p for name, p in student.named_parameters()
                        if not name.startswith("loop_transition.")]
     parameter_groups = [{"params": base_parameters, "lr": args.learning_rate}]
+    if use_query:
+        from torch.nn.parallel import DistributedDataParallel
+        from loop_jev.training.workspace_query import WorkspaceQueryReadout, query_loss
+        query_readout = DistributedDataParallel(
+            WorkspaceQueryReadout(student_base.config.hidden_size).to(local_rank), device_ids=[local_rank],
+        )
+        parameter_groups.append({"params": list(query_readout.parameters()), "lr": 3e-4})
     if transition_parameters:
         parameter_groups.append({"params": transition_parameters,
                                  "lr": args.transition_learning_rate})
+    parameters_for_clipping = [parameter for group in parameter_groups for parameter in group["params"]]
     optimizer = torch.optim.AdamW(parameter_groups, weight_decay=0.01, foreach=False)
     samples_per_rank = len(encoded) // args.data_parallel_size
     batches_per_rank = math.ceil(samples_per_rank / args.batch_size)
@@ -554,6 +674,11 @@ def main():
         epoch_nonloop_sums = torch.zeros(2, device=local_rank, dtype=torch.float32)
         epoch_text_sum = torch.zeros((), device=local_rank)
         epoch_suffix_sum = torch.zeros((), device=local_rank)
+        epoch_kv_sum = torch.zeros((), device=local_rank)
+        epoch_cot_sum = torch.zeros((), device=local_rank)
+        if use_query:
+            epoch_query_sum = torch.zeros((), device=local_rank)
+            epoch_query_stats = torch.zeros(args.loop_count + 2, dtype=torch.long, device=local_rank)
         epoch_sums = torch.zeros(6, device=local_rank, dtype=torch.float32)
         progress = tqdm(
             loader, desc=f"epoch {epoch + 1}/{args.epochs}", unit="batch",
@@ -573,7 +698,12 @@ def main():
                         print(f"progressive_text_stage={text_stage} first_update={update_step + 1}", flush=True)
                     previous_text_stage = text_stage
             suffix_sequences = batch.pop("suffixes", None)
+            kv_ids = batch.pop("kv_ids", None)
             batch = {key: value.to(local_rank) for key, value in batch.items()}
+            cot_targets = batch.pop("loop_cot_targets", None)
+            if use_query:
+                query_ids = batch.pop("query_ids")
+                query_targets = batch.pop("query_targets")
             teacher_batch = {
                 "input_ids": batch.pop("teacher_input_ids"),
                 "attention_mask": batch.pop("teacher_attention_mask"),
@@ -636,6 +766,7 @@ def main():
                     del teacher_outputs
 
             suffix_capture.clear()
+            kv_capture.clear()
             if use_hidden:
                 student_hidden_capture.clear()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -707,6 +838,29 @@ def main():
                           teacher_process_states, batch["process_valid"])
                           if use_delta else answer_loss.new_zeros(()))
             suffix_loss = answer_loss.new_zeros(())
+            kv_loss = answer_loss.new_zeros(())
+            cot_loss = answer_loss.new_zeros(())
+            workspace_query_loss = answer_loss.new_zeros(())
+            if use_query:
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    query_logits, masked_logits = query_readout(
+                        torch.stack(student_base.model.loop_workspace_states), query_ids,
+                    )
+                workspace_query_loss, query_stats = query_loss(query_logits, masked_logits, query_targets)
+                epoch_query_sum += workspace_query_loss.detach()
+                epoch_query_stats += query_stats
+            if use_loop_cot:
+                from torch.utils.checkpoint import checkpoint
+                cot_loss = checkpoint(token_loss, student_outputs.logits[:, :-1, :],
+                                      cot_targets, use_reentrant=False)
+            if use_kv:
+                from loop_jev.training.latent_kv import kv_alignment_loss
+                target_keys = torch.stack([kv_targets[row_id][0] for row_id in kv_ids]).to(local_rank)
+                target_values = torch.stack([kv_targets[row_id][1] for row_id in kv_ids]).to(local_rank)
+                kv_loss = kv_alignment_loss(
+                    kv_capture["key"], kv_capture["value"], target_keys, target_values,
+                )
+                del target_keys, target_values
             if use_suffix:
                 from loop_jev.training.suffix_prediction import suffix_prediction_loss
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -716,7 +870,10 @@ def main():
                         embedding_scale=teacher.config.initializer_range,
                     )
             loss = (
-                args.suffix_loss_weight * suffix_loss + answer_loss + args.logit_loss_weight * logit_loss
+                args.kv_loss_weight * kv_loss + args.suffix_loss_weight * suffix_loss
+                + args.loop_cot_weight * cot_loss
+                + args.workspace_query_weight * workspace_query_loss
+                + answer_loss + args.logit_loss_weight * logit_loss
                 + args.hidden_loss_weight * hidden_loss
                 + args.process_loss_weight * process_loss
                 + args.delta_loss_weight * delta_loss
@@ -730,7 +887,12 @@ def main():
                 student_base.model.loop_updates = []
             student_loop_capture.clear()
             suffix_capture.clear()
+            kv_capture.clear()
+            if use_loop_cot or use_query:
+                student_base.model.loop_workspace_states = []
             epoch_suffix_sum += suffix_loss.detach()
+            epoch_kv_sum += kv_loss.detach()
+            epoch_cot_sum += cot_loss.detach()
             nonloop_answer_loss = answer_loss.new_zeros(())
             nonloop_logit_loss = answer_loss.new_zeros(())
             if use_nonloop:
@@ -795,7 +957,7 @@ def main():
             ])
             if sync_now:
                 update_step += 1
-                grad_norm = clip_grad_norm_mixed(student.parameters(), 1.0)
+                grad_norm = clip_grad_norm_mixed(parameters_for_clipping, 1.0)
                 if not torch.isfinite(grad_norm):
                     raise FloatingPointError(f"Non-finite gradient norm at update {update_step}")
                 optimizer.step()
@@ -809,6 +971,8 @@ def main():
                         process=f"{process_loss.item():.5f}",
                         delta=f"{delta_loss.item():.5f}",
                         suffix=f"{suffix_loss.item():.5f}",
+                        kv=f"{kv_loss.item():.5f}",
+                        cot=f"{cot_loss.item():.5f}",
                         text=f"{text_loss.item():.5f}",
                         direct_ce=f"{nonloop_answer_loss.item():.5f}" if use_nonloop else "-",
                         direct_kl=f"{nonloop_logit_loss.item():.5f}" if use_nonloop else "-",
@@ -820,9 +984,13 @@ def main():
         dist.all_reduce(epoch_nonloop_sums)
         dist.all_reduce(epoch_text_sum)
         dist.all_reduce(epoch_suffix_sum)
+        dist.all_reduce(epoch_kv_sum)
+        dist.all_reduce(epoch_cot_sum)
         dist.all_reduce(epoch_sums, op=dist.ReduceOp.SUM)
         mean_losses = (epoch_sums / (len(loader) * world_size)).tolist()
         mean_suffix_loss = (epoch_suffix_sum / (len(loader) * world_size)).item()
+        mean_kv_loss = (epoch_kv_sum / (len(loader) * world_size)).item()
+        mean_cot_loss = (epoch_cot_sum / (len(loader) * world_size)).item()
         mean_text_loss = (epoch_text_sum / (len(loader) * world_size)).item()
         mean_nonloop = (epoch_nonloop_sums / (len(loader) * world_size)).tolist()
         completed_epochs = epoch + 1
@@ -833,12 +1001,27 @@ def main():
         dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
         training_history.append(dict(zip(
             ("ce", "kl", "hidden", "total", "process", "delta"), mean_losses,
-        ), epoch=completed_epochs, suffix=mean_suffix_loss, text=mean_text_loss,
+        ), epoch=completed_epochs, suffix=mean_suffix_loss, kv=mean_kv_loss, text=mean_text_loss,
+            loop_cot=mean_cot_loss,
             nonloop_ce=mean_nonloop[0], nonloop_kl=mean_nonloop[1],
             peak_allocated_gib=peak_memory[0].item(), peak_reserved_gib=peak_memory[1].item()))
+        if use_query:
+            dist.all_reduce(epoch_query_sum)
+            dist.all_reduce(epoch_query_stats)
+            *per_round, masked, count = epoch_query_stats.tolist()
+            query_metrics = dict(
+                loss=(epoch_query_sum / (len(loader) * world_size)).item(),
+                exact_by_round=[correct / count if count else None for correct in per_round],
+                exact_without_workspace=masked / count if count else None,
+                queries=count,
+            )
+            training_history[-1]["workspace_query"] = query_metrics
+            if rank == 0:
+                print(f"workspace_query epoch={epoch + 1} {json.dumps(query_metrics)}", flush=True)
         if rank == 0:
             print(
-                f"text={mean_text_loss:.6f} suffix={mean_suffix_loss:.6f} epoch={epoch + 1} "
+                f"text={mean_text_loss:.6f} suffix={mean_suffix_loss:.6f} "
+                f"kv={mean_kv_loss:.6f} loop_cot={mean_cot_loss:.6f} epoch={epoch + 1} "
                 f"mean_nonloop_ce={mean_nonloop[0]:.6f} mean_nonloop_kl={mean_nonloop[1]:.6f} "
                 f"mean_ce={mean_losses[0]:.6f} "
                 f"mean_kl={mean_losses[1]:.6f} mean_hidden={mean_losses[2]:.6f} "
@@ -854,6 +1037,8 @@ def main():
     )
     if rank == 0:
         tokenizer.save_pretrained(args.output)
+        if use_query:
+            torch.save(query_readout.module.state_dict(), args.output / "workspace_query.pt")
         metadata = {
             "model": args.model,
             "model_revision": getattr(student_base.config, "_commit_hash", None),
@@ -865,6 +1050,7 @@ def main():
             "loop_count": args.loop_count,
             "loop_parameter_sharing": True if not use_loop_teacher else None,
             "loop_damping": args.loop_damping,
+            "loop_carry_workspace": args.loop_carry_workspace,
             "transition_type": args.transition_type,
             "delta_loss_weight": args.delta_loss_weight,
             "delta_target": "consecutive teacher prefix answer slots at loop_end_layer output" if use_delta else None,
@@ -921,8 +1107,20 @@ def main():
             ),
             "answer_supervision": args.answer_supervision,
             "nonloop_loss_weight": args.nonloop_loss_weight,
+            "latent_slots": args.latent_slots,
+            "latent_marker_token_id": getattr(student_base.config, "latent_marker_token_id", None),
+            "kv_loss_weight": args.kv_loss_weight,
+            "loop_cot_weight": args.loop_cot_weight,
+            "loop_cot_order": args.loop_cot_order if use_loop_cot else None,
+            "loop_cot_tokens": args.loop_cot_tokens if use_loop_cot else None,
+            "workspace_query_weight": args.workspace_query_weight,
+            "workspace_query_coverage": query_coverage,
+            "kv_layer_0_indexed": args.kv_layer if use_kv else None,
+            "kv_cache": str(args.kv_cache) if use_kv else None,
+            "kv_objective": "cosine alignment of pre-RoPE normalized K and V at latent workspace positions, final loop only" if use_kv else None,
             "nonloop_objective": "same question-only input and full-rationale teacher target as final-loop; weighted CE+KL mixture, sequential backward" if use_nonloop else None,
-            "student_input": "question and options only, followed by Answer: (",
+            "student_input": (f"question and options, {args.latent_slots} latent marker tokens, then Answer: ("
+                              if args.latent_slots else "question and options only, followed by Answer: ("),
             "teacher_input": ("question and options only, followed by Answer: (; recurrent loop teacher"
                               if use_loop_teacher else
                               "question, options, and full training rationale, followed by Answer: ("),

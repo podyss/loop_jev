@@ -26,7 +26,7 @@ def read_rows(path, limit=None):
     return rows
 
 
-def render_prompt(tokenizer, row):
+def render_prompt(tokenizer, row, latent_slots=0, latent_marker_token_id=None):
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     options = "\n".join(f"({labels[i]}) {option}" for i, option in enumerate(row["options"]))
     text = f"Question: {row['question']}\nOptions:\n{options}"
@@ -38,13 +38,18 @@ def render_prompt(tokenizer, row):
         enable_thinking=False,
     )
     answer_slot = tokenizer.encode("Answer: (", add_special_tokens=False)
+    if latent_slots:
+        if latent_marker_token_id is None:
+            raise ValueError("Latent checkpoint is missing its marker token ID")
+        prompt_ids += [latent_marker_token_id] * latent_slots
     return prompt_ids + answer_slot
 
 
 def score_vllm(args, rows, tokenizer, candidate_ids):
     from vllm import LLM, SamplingParams
 
-    prompts = [{"prompt_token_ids": render_prompt(tokenizer, row)} for row in rows]
+    prompts = [{"prompt_token_ids": render_prompt(tokenizer, row, args._latent_slots,
+                                                  args._latent_marker_token_id)} for row in rows]
     model = LLM(
         model=args.model,
         dtype=args.dtype,
@@ -100,7 +105,8 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
     ).eval()
     if not args.disable_looping:
         from loop_jev.looping import enable_configured_looping
-        enable_configured_looping(model, use_transition=not args.disable_transition)
+        enable_configured_looping(model, use_transition=not args.disable_transition,
+                                  readout_round=args.loop_readout_round)
     device = model.get_input_embeddings().weight.device
     rank = args._worker_rank
     desc = "Evaluating" if rank is None else f"Evaluating rank {rank}"
@@ -108,7 +114,8 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
               position=rank or 0) as progress:
         for start in range(0, len(rows), args.batch_size):
             batch_rows = rows[start:start + args.batch_size]
-            prompts = [render_prompt(tokenizer, row) for row in batch_rows]
+            prompts = [render_prompt(tokenizer, row, args._latent_slots,
+                                     args._latent_marker_token_id) for row in batch_rows]
             max_length = max(map(len, prompts))
             pad_id = tokenizer.pad_token_id
             if pad_id is None:
@@ -146,6 +153,8 @@ def main():
                         help="Inference engine")
     parser.add_argument("--disable-looping", action="store_true",
                         help="Run a loop-configured checkpoint with one pass through each layer")
+    parser.add_argument("--loop-readout-round", type=int,
+                        help="Stop at this round while retaining the training-time damping step size")
     parser.add_argument("--disable-transition", action="store_true",
                         help="Bypass the transition head while retaining checkpoint looping and damping")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16",
@@ -157,6 +166,9 @@ def main():
     parser.add_argument("--data-parallel-size", type=int, default=1)
     parser.add_argument("--_worker-rank", type=int)
     args = parser.parse_args()
+    if args.loop_readout_round is not None and (args.loop_readout_round < 1
+                                                or args.disable_looping or args.backend != "transformers"):
+        parser.error("--loop-readout-round requires a positive round and enabled Transformers looping")
     if args.disable_transition and (args.disable_looping or args.backend != "transformers"):
         parser.error("--disable-transition requires --backend transformers and enabled looping")
     if args.batch_size < 1:
@@ -195,6 +207,8 @@ def main():
                     command.append("--disable-looping")
                 if args.disable_transition:
                     command.append("--disable-transition")
+                if args.loop_readout_round is not None:
+                    command.extend(["--loop-readout-round", str(args.loop_readout_round)])
                 if args.limit is not None:
                     command.extend(["--limit", str(args.limit)])
                 worker_env = dict(os.environ)
@@ -239,6 +253,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    if args.loop_readout_round is not None and (getattr(config, "loop_count", 1) < 2
+                                                or args.loop_readout_round > config.loop_count):
+        parser.error("--loop-readout-round requires a looped checkpoint and cannot exceed its trained rounds")
+    args._latent_slots = getattr(config, "latent_slots", 0)
+    args._latent_marker_token_id = getattr(config, "latent_marker_token_id", None)
+    if args._latent_slots and (args._latent_marker_token_id is None
+                               or not 0 <= args._latent_marker_token_id < len(tokenizer)):
+        parser.error("Latent checkpoint has an invalid marker token ID")
     if (getattr(config, "loop_count", 1) > 1 and not args.disable_looping
             and args.backend == "vllm"):
         parser.error("Looped checkpoints require --backend transformers")
@@ -269,6 +291,7 @@ def main():
             "dtype": args.dtype,
             "disable_looping": args.disable_looping,
             "disable_transition": args.disable_transition,
+            "loop_readout_round": args.loop_readout_round,
             "probability_dtype": "float32",
             "prediction_index": pred,
             "prediction_label": chr(ord("A") + pred),

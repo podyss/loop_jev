@@ -21,10 +21,19 @@ def without_looping(model):
 
 
 def enable_looping(model, start_layer, end_layer, loop_count, damping=False, collect_all_readouts=True,
-                   use_transition=True, collect_updates=False):
+                   use_transition=True, collect_updates=False, workspace_slice=None,
+                   carry_workspace=None, readout_round=None):
     """Repeat decoder block [start_layer, end_layer) with shared parameters."""
     if loop_count < 1:
         raise ValueError("loop_count must be positive")
+    rounds = loop_count if readout_round is None else readout_round
+    if not 1 <= rounds <= loop_count:
+        raise ValueError("readout_round must be between 1 and the trained loop count")
+    if carry_workspace is not None:
+        slots, suffix = carry_workspace
+        if slots < 1 or suffix < 1 or loop_count < 2:
+            raise ValueError("Workspace carry requires slots, an answer suffix, and multiple loops")
+        import torch
     backbone = getattr(model, "model", None)
     if backbone is None or "Qwen3Model" not in backbone.__class__.__name__:
         raise TypeError("Looping currently supports Qwen3ForCausalLM models")
@@ -94,6 +103,7 @@ def enable_looping(model, start_layer, end_layer, loop_count, damping=False, col
 
         loop_readouts = []
         loop_updates = []
+        workspace_states = []
         linear_delta = getattr(model.config, "loop_transition_type", "mlp") == "linear-delta"
 
         def transition(state):
@@ -103,7 +113,9 @@ def enable_looping(model, start_layer, end_layer, loop_count, damping=False, col
             return model.loop_transition(state)
 
         loop_input = hidden_states
-        for loop_index in range(loop_count):
+        if carry_workspace is not None and hidden_states.shape[1] < slots + suffix:
+            raise ValueError("Input is too short for the configured workspace and answer suffix")
+        for loop_index in range(rounds):
             previous = loop_input
             block_output = loop_input
             for index in range(start_layer, end_layer):
@@ -119,22 +131,30 @@ def enable_looping(model, start_layer, end_layer, loop_count, damping=False, col
                     (loop_input[:, :-1, :], loop_input[:, -1:, :] + correction), dim=1)
             if collect_updates:
                 loop_updates.append(loop_input[:, -1, :].float() - previous[:, -1, :].float())
+            if workspace_slice is not None:
+                workspace_states.append(loop_input[:, workspace_slice, :].clone())
 
-            if collect_all_readouts or loop_index + 1 == loop_count:
+            if collect_all_readouts or loop_index + 1 == rounds:
                 readout = loop_input
                 for index in range(end_layer, len(layers)):
                     readout = run_layer(index, readout)
                 loop_readouts.append(this.norm(readout))
             # The final readout precedes the transition: K loops use K-1 updates.
-            if use_transition and not linear_delta and loop_index + 1 < loop_count and hasattr(model, "loop_transition"):
+            if use_transition and not linear_delta and loop_index + 1 < rounds and hasattr(model, "loop_transition"):
                 if this.training and model.is_gradient_checkpointing:
                     from torch.utils.checkpoint import checkpoint
                     loop_input = checkpoint(model.loop_transition, loop_input, use_reentrant=False)
                 else:
                     loop_input = model.loop_transition(loop_input)
+            if carry_workspace is not None and loop_index + 1 < rounds:
+                loop_input = torch.cat((hidden_states[:, :-(slots + suffix), :],
+                                       loop_input[:, -(slots + suffix):-suffix, :],
+                                       hidden_states[:, -suffix:, :]), dim=1)
 
         this.loop_updates = loop_updates
         this.loop_hidden_states = loop_readouts
+        if workspace_slice is not None:
+            this.loop_workspace_states = workspace_states
         hidden_states = loop_readouts[-1]
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
@@ -148,10 +168,13 @@ def enable_looping(model, start_layer, end_layer, loop_count, damping=False, col
     model.config.loop_end_layer = end_layer
     model.config.loop_count = loop_count
     model.config.loop_damping = bool(damping)
+    model.config.loop_carry_workspace = carry_workspace is not None
+    if carry_workspace is not None:
+        model.config.loop_workspace_suffix = suffix
     return model
 
 
-def enable_configured_looping(model, *, use_transition=True):
+def enable_configured_looping(model, *, use_transition=True, readout_round=None):
     config = model.config
     if getattr(config, "loop_count", 1) > 1:
         enable_looping(
@@ -162,5 +185,8 @@ def enable_configured_looping(model, *, use_transition=True):
             getattr(config, "loop_damping", False),
             collect_all_readouts=False,
             use_transition=use_transition,
+            carry_workspace=(config.latent_slots, config.loop_workspace_suffix)
+            if getattr(config, "loop_carry_workspace", False) else None,
+            readout_round=readout_round,
         )
     return model
