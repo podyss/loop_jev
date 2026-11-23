@@ -26,23 +26,25 @@ def read_rows(path, limit=None):
     return rows
 
 
-def render_prompt(tokenizer, row, latent_slots=0, latent_marker_token_id=None):
+def render_prompt(tokenizer, row, latent_slots=0, latent_marker_token_id=None, *, handoff=False):
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     options = "\n".join(f"({labels[i]}) {option}" for i, option in enumerate(row["options"]))
     text = f"Question: {row['question']}\nOptions:\n{options}"
-    prompt_ids = tokenizer.apply_chat_template(
-        [{"role": "user", "content": text}],
-        tokenize=True,
-        return_dict=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    if handoff:
+        from loop_jev.staged_handoff import encode_handoff_prompt
+        prompt_ids, option_start = encode_handoff_prompt(tokenizer, row['question'], text)
+    else:
+        prompt_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": text}], tokenize=True, return_dict=False,
+            add_generation_prompt=True, enable_thinking=False,
+        )
     answer_slot = tokenizer.encode("Answer: (", add_special_tokens=False)
     if latent_slots:
         if latent_marker_token_id is None:
             raise ValueError("Latent checkpoint is missing its marker token ID")
         prompt_ids += [latent_marker_token_id] * latent_slots
-    return prompt_ids + answer_slot
+    prompt_ids = prompt_ids + answer_slot
+    return (prompt_ids, option_start) if handoff else prompt_ids
 
 
 def score_vllm(args, rows, tokenizer, candidate_ids):
@@ -103,10 +105,19 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
         args.model, dtype=dtype, device_map={"": 0},
         attn_implementation="sdpa", trust_remote_code=False,
     ).eval()
-    if not args.disable_looping:
+    option_workspace = getattr(model.config, "option_workspace", False)
+    refinement_ids = getattr(model.config, "loop_refinement_token_ids", None)
+    refinement = bool(refinement_ids) and not args.disable_looping
+    if refinement and refinement_ids != candidate_ids:
+        raise ValueError("Refinement checkpoint label tokens do not match the evaluation tokenizer")
+    handoff = getattr(model.config, "loop_staged_handoff", False) and not args.disable_looping
+    if option_workspace:
+        from loop_jev.option_workspace import encode_option_prompt, pad_option_spans
+    if not args.disable_looping or option_workspace:
         from loop_jev.looping import enable_configured_looping
         enable_configured_looping(model, use_transition=not args.disable_transition,
-                                  readout_round=args.loop_readout_round)
+                                  readout_round=args.loop_readout_round, bypass_looping=args.disable_looping,
+                                  reset_latent_core=args.reset_latent_core)
     device = model.get_input_embeddings().weight.device
     rank = args._worker_rank
     desc = "Evaluating" if rank is None else f"Evaluating rank {rank}"
@@ -114,9 +125,32 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
               position=rank or 0) as progress:
         for start in range(0, len(rows), args.batch_size):
             batch_rows = rows[start:start + args.batch_size]
-            prompts = [render_prompt(tokenizer, row, args._latent_slots,
-                                     args._latent_marker_token_id) for row in batch_rows]
+            if option_workspace:
+                encoded = [encode_option_prompt(tokenizer, row) for row in batch_rows]
+                suffix = tokenizer.encode("Answer: (", add_special_tokens=False)
+                prompts = [ids + [args._latent_marker_token_id] * args._latent_slots + suffix for ids, _ in encoded]
+            elif handoff:
+                encoded = [render_prompt(tokenizer, row, args._latent_slots, args._latent_marker_token_id,
+                                         handoff=True) for row in batch_rows]
+                prompts, handoff_offsets = zip(*encoded)
+            else:
+                prompts = [render_prompt(tokenizer, row, args._latent_slots,
+                                         args._latent_marker_token_id) for row in batch_rows]
             max_length = max(map(len, prompts))
+            option_kwargs = {}
+            if args.disable_evidence_reread:
+                option_kwargs["disable_evidence_reread"] = True
+            if refinement:
+                option_kwargs["refine_answer_scores"] = True
+            if option_workspace:
+                option_kwargs["option_spans"] = pad_option_spans(
+                    [spans for _, spans in encoded], [max_length - len(ids) for ids in prompts],
+                ).to(device)
+            if handoff:
+                option_kwargs["handoff_option_start"] = torch.tensor([
+                    offset + max_length - len(prompt) for offset, prompt in zip(handoff_offsets, prompts)
+                ], device=device)
+                option_kwargs["swap_handoff"] = args.swap_handoff
             pad_id = tokenizer.pad_token_id
             if pad_id is None:
                 pad_id = tokenizer.eos_token_id
@@ -132,8 +166,9 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
                     attention_mask=attention_mask.to(device),
                     logits_to_keep=1,
                     use_cache=False,
+                    **option_kwargs,
                 ).logits
-            scores = logits[:, -1, candidate_ids].float().cpu()
+            scores = (logits if option_workspace or refinement else logits[:, -1, candidate_ids]).float().cpu()
             for row, row_scores in zip(batch_rows, scores):
                 yield row, row_scores[:len(row["options"])]
             progress.update(len(batch_rows))
@@ -153,24 +188,39 @@ def main():
                         help="Inference engine")
     parser.add_argument("--disable-looping", action="store_true",
                         help="Run a loop-configured checkpoint with one pass through each layer")
+    parser.add_argument("--disable-latent-slots", action="store_true",
+                        help="Remove workspace markers as well as looping for the direct ablation")
     parser.add_argument("--loop-readout-round", type=int,
                         help="Stop at this round while retaining the training-time damping step size")
+    parser.add_argument("--reset-latent-core", action="store_true",
+                        help="Reset the dedicated latent state just before the final round")
     parser.add_argument("--disable-transition", action="store_true",
                         help="Bypass the transition head while retaining checkpoint looping and damping")
+    parser.add_argument("--disable-evidence-reread", action="store_true",
+                        help="Bypass both evidence reads while retaining checkpoint looping and damping")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16",
                         help="Inference weight/compute dtype; probabilities use FP32")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5,
                         help="vLLM per-GPU memory fraction (verl rollout default: 0.5)")
+    parser.add_argument("--swap-handoff", action="store_true",
+                        help="Rotate first-round latent states across examples in each evaluation batch")
     parser.add_argument("--enforce-eager", action="store_true", help="Disable vLLM compilation/CUDA graphs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-parallel-size", type=int, default=1)
     parser.add_argument("--_worker-rank", type=int)
     args = parser.parse_args()
+    if args.disable_latent_slots and not args.disable_looping:
+        parser.error("--disable-latent-slots requires --disable-looping")
     if args.loop_readout_round is not None and (args.loop_readout_round < 1
                                                 or args.disable_looping or args.backend != "transformers"):
         parser.error("--loop-readout-round requires a positive round and enabled Transformers looping")
     if args.disable_transition and (args.disable_looping or args.backend != "transformers"):
         parser.error("--disable-transition requires --backend transformers and enabled looping")
+    if args.disable_evidence_reread and (args.disable_looping or args.backend != "transformers"
+                                         or args.loop_readout_round is not None):
+        parser.error("--disable-evidence-reread requires Transformers at the full loop depth")
+    if args.swap_handoff and (args.disable_looping or args.backend != "transformers" or args.batch_size < 2):
+        parser.error("--swap-handoff requires enabled Transformers looping and batches of at least two")
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if not 0 < args.gpu_memory_utilization <= 1:
@@ -205,8 +255,16 @@ def main():
                     command.append("--enforce-eager")
                 if args.disable_looping:
                     command.append("--disable-looping")
+                if args.disable_latent_slots:
+                    command.append("--disable-latent-slots")
+                if args.reset_latent_core:
+                    command.append("--reset-latent-core")
                 if args.disable_transition:
                     command.append("--disable-transition")
+                if args.disable_evidence_reread:
+                    command.append("--disable-evidence-reread")
+                if args.swap_handoff:
+                    command.append("--swap-handoff")
                 if args.loop_readout_round is not None:
                     command.extend(["--loop-readout-round", str(args.loop_readout_round)])
                 if args.limit is not None:
@@ -253,10 +311,26 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    if args.disable_evidence_reread and not getattr(config, "loop_evidence_reread", False):
+        parser.error("--disable-evidence-reread requires an evidence reread checkpoint")
+    if args.swap_handoff and (not getattr(config, "loop_staged_handoff", False)
+                              or len(rows) < 2 or len(rows) % args.batch_size == 1):
+        parser.error("--swap-handoff requires a handoff checkpoint and no singleton batches on each shard")
+    if getattr(config, "loop_staged_handoff", False) and args.loop_readout_round == 1:
+        parser.error("Staged handoff requires at least two rounds; use --disable-looping for a standard single pass")
+    if getattr(config, "option_workspace", False) and (
+        args.backend != "transformers" or any(len(row["options"]) != 4 for row in rows)
+    ):
+        parser.error("Option workspace checkpoints require --backend transformers and four choices per row")
     if args.loop_readout_round is not None and (getattr(config, "loop_count", 1) < 2
                                                 or args.loop_readout_round > config.loop_count):
         parser.error("--loop-readout-round requires a looped checkpoint and cannot exceed its trained rounds")
-    args._latent_slots = getattr(config, "latent_slots", 0)
+    if args.reset_latent_core and (not getattr(config, "latent_core_width", 0) or args.disable_looping
+                                   or args.loop_readout_round is not None or args.backend != "transformers"):
+        parser.error("--reset-latent-core requires the full dedicated core and --backend transformers")
+    if args.disable_latent_slots and getattr(config, "option_workspace", False):
+        parser.error("Option workspace checkpoints do not support --disable-latent-slots")
+    args._latent_slots = 0 if args.disable_latent_slots else getattr(config, "latent_slots", 0)
     args._latent_marker_token_id = getattr(config, "latent_marker_token_id", None)
     if args._latent_slots and (args._latent_marker_token_id is None
                                or not 0 <= args._latent_marker_token_id < len(tokenizer)):
@@ -266,6 +340,8 @@ def main():
         parser.error("Looped checkpoints require --backend transformers")
     if getattr(config, "loop_transition_rank", 0) > 0 and args.backend != "transformers":
         parser.error("Transition checkpoints require --backend transformers, including --disable-looping")
+    if getattr(config, "loop_refinement_token_ids", None) and args.loop_readout_round == 1:
+        parser.error("Use --disable-looping for the undamped first-pass refinement readout")
     if args.disable_transition and (getattr(config, "loop_transition_rank", 0) <= 0
                                     or getattr(config, "loop_count", 1) <= 1):
         parser.error("--disable-transition requires a checkpoint with a transition head and multiple loops")
@@ -290,8 +366,13 @@ def main():
             "backend": args.backend,
             "dtype": args.dtype,
             "disable_looping": args.disable_looping,
+            **({"latent_slots": 0} if args.disable_latent_slots else {}),
             "disable_transition": args.disable_transition,
+            **({"swap_handoff": args.swap_handoff} if getattr(config, "loop_staged_handoff", False) else {}),
+            **({"disable_evidence_reread": args.disable_evidence_reread}
+               if getattr(config, "loop_evidence_reread", False) else {}),
             "loop_readout_round": args.loop_readout_round,
+            "reset_latent_core": args.reset_latent_core,
             "probability_dtype": "float32",
             "prediction_index": pred,
             "prediction_label": chr(ord("A") + pred),

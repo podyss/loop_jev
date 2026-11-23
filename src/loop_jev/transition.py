@@ -1,10 +1,21 @@
 """Qwen3 with a checkpointed, shared residual transition between loop passes."""
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, Qwen3ForCausalLM
 from transformers import initialization as init
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+
+from loop_jev.up_loop import UpLoopQwen3DecoderLayer
+from loop_jev.option_workspace import SLOT_COUNT, SLOTS_PER_OPTION
+
+
+@dataclass
+class OptionWorkspaceOutput(CausalLMOutputWithPast):
+    answer_token_logits: torch.Tensor | None = None
 
 
 class ZeroInitLinear(nn.Linear):
@@ -45,14 +56,67 @@ class LinearLoopCorrection(nn.Module):
 
 
 class Qwen3LoopForCausalLM(Qwen3ForCausalLM):
+    _no_split_modules = [*Qwen3ForCausalLM._no_split_modules, "UpLoopQwen3DecoderLayer"]
+
     def __init__(self, config):
         super().__init__(config)
+        if getattr(config, "loop_schedule", "block") == "layerwise-gated":
+            if not (0 <= config.loop_start_layer < config.loop_end_layer <= len(self.model.layers)
+                    and config.loop_count >= 2):
+                raise ValueError("Invalid span or round count for gated looping")
+            for index in range(config.loop_start_layer, config.loop_end_layer):
+                self.model.layers[index] = UpLoopQwen3DecoderLayer(config, index)
         if getattr(config, "loop_transition_rank", 0) > 0:
             self.loop_transition = (LinearLoopCorrection(config)
                 if getattr(config, "loop_transition_type", "mlp") == "linear-delta"
                 else LoopTransition(config))
+        option_workspace = getattr(config, "option_workspace", False)
+        if option_workspace:
+            self.option_slot_offsets = nn.Embedding(SLOTS_PER_OPTION, config.hidden_size)
+            self.option_scorer = nn.Linear(config.hidden_size, 1, bias=False)
+        refinement_ids = getattr(config, "loop_refinement_token_ids", None)
+        if refinement_ids:
+            self.loop_answer_refinement = ZeroInitLinear(config.hidden_size, len(refinement_ids), bias=False)
+            nn.init.zeros_(self.loop_answer_refinement.weight)
+        core_width = getattr(config, "latent_core_width", 0)
+        if core_width:
+            from loop_jev.latent_core import LatentCore
+            self.latent_core = LatentCore(config.hidden_size, core_width, ZeroInitLinear)
+        if (getattr(config, "loop_schedule", "block") == "layerwise-gated"
+                or getattr(config, "loop_transition_rank", 0) > 0 or option_workspace or refinement_ids
+                or core_width):
             # Register before from_pretrained applies FSDP or loads checkpoint tensors.
             self.post_init()
+
+    def forward(self, *args, option_spans=None, option_vocab_logits=False, refine_answer_scores=False, **kwargs):
+        if refine_answer_scores:
+            if not hasattr(self, "loop_answer_refinement") or not hasattr(self.model, "_unlooped_forward"):
+                raise ValueError("Answer refinement needs an enabled refinement checkpoint")
+            kwargs.pop("logits_to_keep", None)
+            kwargs.pop("output_hidden_states", None)
+            kwargs["use_cache"] = False
+            outputs = self.model(*args, **kwargs, refine_answer_scores=True)
+            first = self.model.loop_hidden_states[0]
+            base_logits = self.lm_head(first)
+            delta = self.loop_answer_refinement(outputs.last_hidden_state - first.detach())
+            base_options = base_logits[:, -1, self.config.loop_refinement_token_ids].float()
+            return OptionWorkspaceOutput(logits=base_options.detach() + delta[:, -1, :].float(),
+                                         answer_token_logits=base_logits)
+        if not getattr(self.config, "option_workspace", False):
+            return super().forward(*args, **kwargs)
+        if option_spans is None or not hasattr(self.model, "_unlooped_forward"):
+            raise ValueError("Option workspace requires option spans and an enabled block forward")
+        offsets = self.option_slot_offsets(torch.arange(SLOTS_PER_OPTION, device=option_spans.device))
+        kwargs.pop("logits_to_keep", None)
+        kwargs.pop("output_hidden_states", None)
+        kwargs["use_cache"] = False
+        outputs = self.model(*args, **kwargs, option_workspace_input=(option_spans, offsets))
+        hidden = outputs.last_hidden_state
+        suffix = self.config.option_workspace_suffix
+        states = hidden[:, -SLOT_COUNT - suffix:-suffix][:, SLOTS_PER_OPTION - 1::SLOTS_PER_OPTION]
+        logits = self.option_scorer(states).squeeze(-1)
+        vocabulary = self.lm_head(hidden[:, -1:, :]) if option_vocab_logits else None
+        return OptionWorkspaceOutput(logits=logits, answer_token_logits=vocabulary)
 
     def _init_weights(self, module):
         if isinstance(module, ZeroInitLinear):
@@ -65,9 +129,20 @@ def load_loop_model(path, *, config=None, **kwargs):
     """Load adapter tensors with their owning class (AutoModel alone drops them)."""
     if config is None:
         config = AutoConfig.from_pretrained(path, trust_remote_code=False)
+    gated = getattr(config, "loop_schedule", "block") == "layerwise-gated"
     model_class = AutoModelForCausalLM
-    if getattr(config, "loop_transition_rank", 0) > 0:
+    if (getattr(config, "loop_transition_rank", 0) > 0 or gated or getattr(config, "option_workspace", False)
+            or getattr(config, "loop_refinement_token_ids", None) or getattr(config, "latent_core_width", 0)):
         if config.model_type != "qwen3":
-            raise ValueError("Loop transitions currently support Qwen3 only")
+            raise ValueError("Loop extensions currently support Qwen3 only")
         model_class = Qwen3LoopForCausalLM
+    if gated:
+        return_loading_info = kwargs.pop("output_loading_info", False)
+        model, info = model_class.from_pretrained(path, config=config, output_loading_info=True, **kwargs)
+        # Missing weights inside the nested HF backbone bypass the outer initializer.
+        with torch.no_grad():
+            for key in info["missing_keys"]:
+                if key.endswith(".loop_gates.raw"):
+                    model.get_parameter(key).zero_()
+        return (model, info) if return_loading_info else model
     return model_class.from_pretrained(path, config=config, **kwargs)

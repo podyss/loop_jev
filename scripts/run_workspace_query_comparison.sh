@@ -4,12 +4,11 @@ cd "$(dirname "$0")/.."
 export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,2}"
 
-prior=outputs/jev-loop-cot-comparison
-validation="$prior/validation.jsonl"
-eval_dir=outputs/jev-workspace-query-comparison/validation
+test_input=data/gsm-mc/test.jsonl
+eval_dir=outputs/jev-workspace-query-comparison/test
 checkpoint_root="${1:-/dev/shm/loop-jev-$(id -u)/workspace-query}"
-for file in "$validation" "$prior"/validation/{ce1-native,ce3-native,ce3-no_loop}.jsonl; do
-  [[ -s "$file" ]] || { echo "Missing validation input or baseline: $file" >&2; exit 1; }
+for file in "$test_input" outputs/jev-latent24-ce1-final-ce-kl/eval/gsm-mc-test-loop1.jsonl outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-loop3.jsonl outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-no-loop.jsonl; do
+  [[ -s "$file" ]] || { echo "Missing test input or baseline: $file" >&2; exit 1; }
 done
 
 for loops in 1 3; do
@@ -30,12 +29,12 @@ for loops in 1 3; do
     extra=()
     if [[ "$mode" == no-loop ]]; then extra+=(--disable-looping); fi
     uv run python -m loop_jev.evaluation.zero_shot \
-      --model "$output" --input "$validation" --output "$eval_dir/query-$loops-$mode.jsonl" \
+      --model "$output" --input "$test_input" --output "$eval_dir/query-$loops-$mode.jsonl" \
       --backend transformers --data-parallel-size 2 --batch-size 4 "${extra[@]}"
   done
 done
 
-uv run python - "$eval_dir" "$validation" "$checkpoint_root" <<'PY'
+uv run python - "$eval_dir" "$test_input" "$checkpoint_root" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -43,21 +42,20 @@ from pathlib import Path
 from loop_jev.evaluation.latent_kv_summary import score_file
 from loop_jev.training.answer_slot_distill import read_rows
 
-output, validation, checkpoints = map(Path, sys.argv[1:])
-expected_ids = {row["id"] for row in read_rows(validation)}
-if len(expected_ids) != 1024:
-    raise ValueError(f"Expected the original 1024-example validation split: {validation}")
-prior = validation.parent / "validation"
+output, test_input, checkpoints = map(Path, sys.argv[1:])
+expected_ids = {row["id"] for row in read_rows(test_input)}
+if len(expected_ids) != 1319:
+    raise ValueError(f"Expected the original 1319-example test split: {test_input}")
 files = {
-    "ce_kl_1": (prior / "ce1-native.jsonl", False),
-    "ce_kl_3": (prior / "ce3-native.jsonl", False),
-    "ce_kl_3_no_loop": (prior / "ce3-no_loop.jsonl", True),
+    "ce_kl_1": (Path("outputs/jev-latent24-ce1-final-ce-kl/eval/gsm-mc-test-loop1.jsonl"), False),
+    "ce_kl_3": (Path("outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-loop3.jsonl"), False),
+    "ce_kl_3_no_loop": (Path("outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-no-loop.jsonl"), True),
     "query_1": (output / "query-1-native.jsonl", False),
     "query_3": (output / "query-3-native.jsonl", False),
     "query_3_no_loop": (output / "query-3-no-loop.jsonl", True),
 }
 results = {}
-print(f"GSM-MC validation ({len(expected_ids)} examples)")
+print(f"GSM-MC test ({len(expected_ids)} examples)")
 for label, (path, off) in files.items():
     score, ids = score_file(path, disable_looping=off)
     if ids != expected_ids:

@@ -42,6 +42,21 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--loop-teacher-model", default=None,
                         help="Use a trained looped checkpoint as teacher and keep the student non-looped")
+    parser.add_argument("--disable-teacher-looping", action="store_true",
+                        help="Use the same loop teacher checkpoint and prompt with an ordinary forward pass")
+    parser.add_argument("--block-state-cache", type=Path,
+                        help="Offline teacher answer states or deltas")
+    parser.add_argument("--block-state-weight", type=float, default=0.0)
+    parser.add_argument("--block-state-target-mode", choices=("delta", "absolute"), default="delta")
+    parser.add_argument("--layer-effect-cache", type=Path)
+    parser.add_argument("--layer-effect-layers", type=int, nargs="+", default=[12, 15, 18])
+    parser.add_argument("--layer-effect-mode", choices=("local", "shared", "immediate", "counterfactual"),
+                        default="local")
+    parser.add_argument("--layer-effect-weight", type=float, default=0.0)
+    parser.add_argument("--block-state-shuffle-seed", type=int,
+                        help="Seed for swapping fixed teacher deltas within each gold option group")
+    parser.add_argument("--block-state-rounds", type=int, nargs="+",
+                        help="Teacher target rounds in epoch order; omit to use the final round every epoch")
     parser.add_argument("--train", type=Path, default=Path("data/jev-mathqa/train.jsonl"))
     parser.add_argument("--output", type=Path, default=Path("outputs/jev-answer-slot-distill"))
     parser.add_argument("--epochs", type=int, default=4)
@@ -68,9 +83,22 @@ def main():
     parser.add_argument("--loop-count", type=int, default=3,
                         help="Number of shared-parameter passes through the recurrent block")
     parser.add_argument("--loop-damping", action=argparse.BooleanOptionalAction, default=True,
-                        help="Interpolate each recurrent update by 1 / loop count")
+                        help="Damp each recurrent update")
+    parser.add_argument("--loop-damping-step", type=float,
+                        help="Fixed interpolation coefficient in (0, 1]; default: 1 / loop count")
     parser.add_argument("--loop-carry-workspace", action="store_true",
                         help="Carry only the latent workspace between recurrent rounds")
+    parser.add_argument("--loop-staged-handoff", action="store_true",
+                        help="Route question information to later rounds only through the latent slots")
+    parser.add_argument("--loop-answer-refinement", action="store_true",
+                        help="Train a single-pass answer and an additive correction from the final block round")
+    parser.add_argument("--latent-core-width", type=int, default=0,
+                        help="Width of the dedicated recurrent core; 0 uses the normal Qwen path")
+    parser.add_argument("--latent-core-learning-rate", type=float, default=1e-4)
+    parser.add_argument("--loop-evidence-reread", action="store_true",
+                        help="Reread the original prefix twice with workspace queries and coverage")
+    parser.add_argument("--loop-multiscale-workspace", choices=("up", "up-down"),
+                        help="Aggregate local slots into coarse slots, optionally feeding back their updates")
     parser.add_argument("--transition-rank", type=int, default=0,
                         help="Shared residual transition bottleneck width; 0 disables it")
     parser.add_argument("--transition-type", choices=("mlp", "linear-delta"), default="mlp")
@@ -94,6 +122,8 @@ def main():
                         help="Mix a single-pass CE+KL branch into final-loop CE+KL; 0 recovers baseline")
     parser.add_argument("--latent-slots", type=int, default=0,
                         help="Number of question-only latent workspace positions before the answer slot")
+    parser.add_argument("--option-workspace", action="store_true",
+                        help="Seed six of 24 latent slots per option and read four shared-head scores")
     parser.add_argument("--kv-loss-weight", type=float, default=0.0,
                         help="Align final-loop workspace K/V to offline rationale targets")
     parser.add_argument("--kv-layer", type=int, default=17,
@@ -104,15 +134,152 @@ def main():
     parser.add_argument("--loop-cot-order", choices=("ordered", "shuffled"), default="ordered")
     parser.add_argument("--loop-cot-tokens", type=int, default=8,
                         help="Maximum supervised CoT tokens per round, read from the last latent slots")
+    parser.add_argument("--loop-schedule", choices=("block", "layerwise", "layerwise-gated"), default="block",
+                        help="Repeat the whole loop block or repeat each of its layers consecutively")
+    parser.add_argument("--loop-removal", choices=("abrupt", "gradual"),
+                        help="CE-only continuation from the block10 checkpoint at reduced depth")
+    parser.add_argument("--loop-removal-final-rounds", type=int, choices=(1, 2, 3), default=1)
+    parser.add_argument("--loop-removal-final-step", type=float)
+    parser.add_argument("--loop-removal-keep-slots", action="store_true")
+    parser.add_argument("--layerwise-depth-supervision", action="store_true",
+                        help="Add shallow answer CE and adjacent-depth improvement loss to final CE+KL")
     parser.add_argument("--workspace-query-weight", type=float, default=0.0,
                         help="Weight for training-only readout of intermediate quantities from workspace slots")
+    parser.add_argument("--workspace-dependency-weight", type=float, default=0.0,
+                        help="Train a later block call to compute with the first round's workspace")
+    parser.add_argument("--program-composition-weight", type=float, default=0.0,
+                        help="Weight for training-only arithmetic readouts")
+    parser.add_argument("--program-objective", choices=("composition", "bidirectional"), default="composition")
+    parser.add_argument("--condition-pair-weight", type=float, default=0.0,
+                        help="Keep paired conditions in the same microbatch and supervise opposite answer margins")
     parser.add_argument("--text-max-targets", type=int, default=128,
                         help="Maximum sampled LM target positions per example; does not truncate input text")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-sample-seed", type=int,
+                        help="Seed for selecting training rows; defaults to --seed")
     args = parser.parse_args()
+    train_sample_seed = args.seed if args.train_sample_seed is None else args.train_sample_seed
+    if args.train_sample_seed is not None and args.kv_loss_weight > 0:
+        parser.error("An explicit training sample seed is not supported with cached KV targets")
+    if args.latent_core_width < 0 or args.latent_core_width % 4:
+        parser.error("--latent-core-width must be a nonnegative multiple of four")
+    if args.latent_core_width and (
+        args.latent_core_learning_rate <= 0 or args.latent_slots < 1 or args.loop_count < 2
+        or args.loop_schedule != "block" or args.loop_damping or args.tensor_parallel_size != 1
+        or args.answer_supervision != "final-loop"
+        or any((args.loop_carry_workspace, args.loop_multiscale_workspace, args.loop_staged_handoff,
+                args.loop_evidence_reread, args.loop_answer_refinement, args.transition_rank,
+                args.process_loss_weight, args.delta_loss_weight, args.hidden_loss_weight, args.kv_loss_weight,
+                args.loop_cot_weight, args.workspace_query_weight, args.workspace_dependency_weight,
+                args.option_workspace, args.program_composition_weight, args.condition_pair_weight,
+                args.layerwise_depth_supervision, args.loop_teacher_model, args.suffix_loss_weight,
+                args.progressive_text_weight, args.nonloop_loss_weight))
+    ):
+        parser.error("The latent core requires latent slots, multiple undamped rounds, TP=1 and final answer CE/KL")
+    if args.loop_damping_step is not None and (not args.loop_damping or not 0 < args.loop_damping_step <= 1):
+        parser.error("--loop-damping-step must be in (0, 1] and requires --loop-damping")
     use_kv = args.kv_loss_weight > 0
     use_loop_cot = args.loop_cot_weight > 0
     use_query = args.workspace_query_weight > 0
+    use_dependency = args.workspace_dependency_weight > 0
+    use_option_workspace = args.option_workspace
+    use_program = args.program_composition_weight > 0
+    use_condition_pairs = args.condition_pair_weight > 0
+    if args.loop_evidence_reread and (
+        args.latent_slots != 24 or args.loop_schedule != "block" or args.loop_count != 3
+        or not args.loop_damping or args.answer_supervision != "final-loop" or args.tensor_parallel_size != 1
+        or args.loop_carry_workspace or args.loop_staged_handoff or args.loop_answer_refinement
+        or args.loop_multiscale_workspace not in (None, "up") or args.transition_rank
+        or args.loop_teacher_model or use_program or use_option_workspace or use_query or use_kv
+        or use_loop_cot or use_dependency or use_condition_pairs or args.nonloop_loss_weight
+        or args.hidden_loss_weight or args.delta_loss_weight or args.process_loss_weight
+        or args.suffix_loss_weight or args.progressive_text_weight
+    ):
+        parser.error("Evidence rereading requires three damped block rounds, 24 slots, TP=1 and final CE/KL")
+    if args.loop_answer_refinement and (
+        args.loop_schedule != "block" or args.loop_count != 3 or not args.loop_damping
+        or args.answer_supervision != "final-loop" or args.tensor_parallel_size != 1
+        or args.loop_carry_workspace or args.loop_multiscale_workspace or args.loop_staged_handoff
+        or args.transition_rank or args.loop_teacher_model or use_program or use_option_workspace
+        or use_query or use_kv or use_loop_cot or use_dependency or use_condition_pairs
+        or args.nonloop_loss_weight or args.hidden_loss_weight or args.delta_loss_weight
+        or args.process_loss_weight or args.suffix_loss_weight or args.progressive_text_weight
+    ):
+        parser.error("Answer refinement requires three damped block rounds, final-loop, TP=1 and CE/KL only")
+    if args.loop_staged_handoff:
+        from loop_jev.staged_handoff import encode_handoff_prompt
+        if (args.latent_slots < 1 or args.loop_schedule != "block" or args.loop_count != 3
+                or not args.loop_damping or args.answer_supervision != "final-loop"
+                or args.tensor_parallel_size != 1 or args.loop_carry_workspace or args.loop_multiscale_workspace
+                or args.transition_rank or args.loop_teacher_model or use_program or use_option_workspace
+                or use_query or use_kv or use_loop_cot or use_dependency or use_condition_pairs
+                or args.nonloop_loss_weight or args.hidden_loss_weight or args.delta_loss_weight
+                or args.process_loss_weight or args.suffix_loss_weight or args.progressive_text_weight):
+            parser.error("Staged handoff requires latent slots, three damped block rounds, final-loop, TP=1 and CE/KL only")
+    if not math.isfinite(args.condition_pair_weight) or args.condition_pair_weight < 0:
+        parser.error("Condition pair weight must be finite and nonnegative")
+    if use_condition_pairs:
+        from loop_jev.training.condition_pairs import pair_groups, paired_margin_loss
+        if (args.batch_size < 2 or args.batch_size % 2 or args.answer_supervision != "final-loop"
+                or args.tensor_parallel_size != 1 or args.nonloop_loss_weight):
+            parser.error("Condition pairs require an even batch size, final-loop supervision and TP=1")
+    bidirectional = args.program_objective == "bidirectional"
+    if bidirectional and (not use_program or args.loop_count != 3 or args.latent_slots != 24):
+        parser.error("Bidirectional arithmetic requires a positive program weight and three rounds with 24 slots")
+    if args.loop_multiscale_workspace:
+        from loop_jev.multiscale_workspace import SLOT_COUNT
+        if (args.latent_slots != SLOT_COUNT or args.loop_schedule != "block" or args.loop_count != 3
+                or not args.loop_damping or args.answer_supervision != "final-loop"
+                or args.tensor_parallel_size != 1 or args.loop_carry_workspace
+                or args.transition_rank or args.loop_teacher_model or use_program or use_option_workspace
+                or use_query or use_kv or use_loop_cot or use_dependency or args.nonloop_loss_weight
+                or args.hidden_loss_weight or args.delta_loss_weight or args.process_loss_weight
+                or args.suffix_loss_weight or args.progressive_text_weight):
+            parser.error("Multiscale workspace requires 24 slots, three damped block rounds, final-loop, TP=1 and CE/KL only")
+    if not math.isfinite(args.program_composition_weight) or args.program_composition_weight < 0:
+        parser.error("Program composition weight must be finite and nonnegative")
+    if use_program:
+        from loop_jev.training.program_composition import ProgramReadout, compile_program, program_loss
+        if bidirectional:
+            from loop_jev.training.bidirectional_arithmetic import ArithmeticReadout as ProgramReadout
+            from loop_jev.training.bidirectional_arithmetic import arithmetic_loss as program_loss, compile_targets
+        if (args.loop_schedule != "block" or args.loop_count not in (1, 3)
+                or args.answer_supervision != "final-loop" or args.tensor_parallel_size != 1
+                or (args.loop_count == 1 and args.latent_slots)
+                or (args.loop_count == 3 and not args.loop_damping)
+                or args.loop_teacher_model or args.transition_rank or args.loop_carry_workspace
+                or use_option_workspace or use_query or use_kv or use_loop_cot or use_dependency
+                or args.nonloop_loss_weight or args.process_loss_weight or args.delta_loss_weight
+                or args.hidden_loss_weight or args.suffix_loss_weight or args.progressive_text_weight):
+            parser.error("Program composition requires a slot-free single pass or three damped block rounds, final-loop, TP=1 and no other auxiliary modes besides logit distillation")
+    if use_option_workspace:
+        from loop_jev.option_workspace import SLOT_COUNT, encode_option_prompt, pad_option_spans
+        if (args.latent_slots != SLOT_COUNT or args.loop_schedule != "block"
+                or args.answer_supervision != "final-loop" or args.tensor_parallel_size != 1
+                or args.loop_teacher_model or args.transition_rank or args.loop_carry_workspace
+                or use_query or use_kv or use_loop_cot or use_dependency
+                or args.nonloop_loss_weight or args.process_loss_weight or args.delta_loss_weight
+                or args.hidden_loss_weight or args.suffix_loss_weight or args.progressive_text_weight):
+            parser.error("Option workspace requires 24 slots, a block schedule, final-loop, TP=1 and no auxiliary mode besides logit distillation")
+    if not math.isfinite(args.workspace_dependency_weight) or args.workspace_dependency_weight < 0:
+        parser.error("Workspace dependency weight must be finite and nonnegative")
+    if use_dependency and (
+        not args.latent_slots or args.loop_schedule != "block" or args.loop_count != 3
+        or not args.loop_damping or args.answer_supervision != "final-loop"
+        or args.tensor_parallel_size != 1 or use_query or use_kv or use_loop_cot or args.loop_carry_workspace
+    ):
+        parser.error("Workspace dependency requires latent slots, three damped block rounds, final-loop, TP=1 and no other workspace mode")
+    use_depth = args.layerwise_depth_supervision
+    if use_depth and (args.loop_schedule != "layerwise-gated" or args.loop_count != 3
+                      or args.tensor_parallel_size != 1 or args.nonloop_loss_weight
+                      or args.hidden_loss_weight or args.suffix_loss_weight or args.progressive_text_weight):
+        parser.error("Depth supervision requires three gated layerwise rounds, TP=1 and no other auxiliary modes")
+    if args.loop_schedule != "block" and (
+        args.loop_count < 2 or args.loop_damping or args.answer_supervision != "final-loop"
+        or args.loop_teacher_model or args.transition_rank or args.process_loss_weight
+        or args.delta_loss_weight or args.loop_carry_workspace or use_query or use_loop_cot or use_kv
+    ):
+        parser.error("Layerwise looping requires multiple loops, --no-loop-damping, final-loop and no block-level extras")
     if not math.isfinite(args.workspace_query_weight) or args.workspace_query_weight < 0:
         parser.error("Workspace query weight must be finite and nonnegative")
     if use_query and (not args.latent_slots or args.answer_supervision != "final-loop"
@@ -177,6 +344,31 @@ def main():
         parser.error("--process-loss-discount must be in (0, 1]")
     if args.loop_count < 1:
         parser.error("--loop-count must be positive")
+    if (args.loop_removal_final_rounds != 1 or args.loop_removal_keep_slots
+            or args.loop_removal_final_step is not None) and not args.loop_removal:
+        parser.error("Final loop settings require --loop-removal")
+    if args.loop_removal_final_rounds > 1 and not args.loop_removal_keep_slots:
+        parser.error("Short loops require --loop-removal-keep-slots")
+    if args.loop_removal_final_step is not None and (
+        args.loop_removal_final_rounds == 1 or not 0 < args.loop_removal_final_step <= 1
+    ):
+        parser.error("A final damping step in (0, 1] requires at least two final rounds")
+    if args.loop_removal and (
+        (args.loop_start_layer, args.loop_end_layer, args.loop_count, args.latent_slots,
+         args.loop_damping_step) != (9, 18, 10, 24, 0.1)
+        or not args.loop_damping or args.loop_schedule != "block"
+        or args.answer_supervision != "final-loop" or args.tensor_parallel_size != 1
+        or any((args.loop_teacher_model, args.logit_loss_weight, args.hidden_loss_weight,
+                args.process_loss_weight, args.delta_loss_weight, args.nonloop_loss_weight,
+                args.block_state_cache, args.layer_effect_cache, args.progressive_text_weight,
+                args.suffix_loss_weight, args.kv_loss_weight, args.loop_cot_weight,
+                args.workspace_query_weight, args.workspace_dependency_weight,
+                args.program_composition_weight, args.condition_pair_weight, args.option_workspace,
+                args.transition_rank, args.latent_core_width, args.loop_carry_workspace,
+                args.loop_multiscale_workspace, args.loop_staged_handoff, args.loop_evidence_reread,
+                args.loop_answer_refinement, args.layerwise_depth_supervision))
+    ):
+        parser.error("Loop removal requires the plain block10 configuration, final answer CE only, and TP=1")
     if args.loop_teacher_model and args.transition_rank:
         parser.error("Loop-teacher distillation trains a plain non-looped student; transition heads are disabled")
     if args.loop_teacher_model and args.answer_supervision != "final-loop":
@@ -185,9 +377,47 @@ def main():
         parser.error("Loop-teacher distillation uses recurrent-state alignment, not teacher-delta targets")
     if args.loop_teacher_model and args.loop_count < 2:
         parser.error("Loop-teacher distillation requires at least two teacher loops")
+    if args.disable_teacher_looping and (not args.loop_teacher_model or args.process_loss_weight > 0):
+        parser.error("--disable-teacher-looping requires a loop teacher and no process loss")
+    if (not 0 <= args.block_state_weight < float("inf")
+            or bool(args.block_state_cache) != (args.block_state_weight > 0)):
+        parser.error("Block-state cache and positive finite weight must be supplied together")
+    if args.block_state_cache and (not args.loop_teacher_model or args.disable_teacher_looping
+                                   or not args.loop_damping or args.latent_slots
+                                   or args.tensor_parallel_size != 1):
+        parser.error("Block-state loss requires a damped loop teacher, no student slots and TP size 1")
+    use_layer_effect = bool(args.layer_effect_cache)
+    if (not 0 <= args.layer_effect_weight < float("inf")
+            or use_layer_effect != (args.layer_effect_weight > 0)):
+        parser.error("Layer effect cache and positive finite weight must be supplied together")
+    use_round_effect = use_layer_effect and args.layer_effect_mode in ("immediate", "counterfactual")
+    if use_layer_effect and (not args.loop_teacher_model or args.disable_teacher_looping or args.block_state_cache
+                             or not args.loop_damping or args.latent_slots or args.tensor_parallel_size != 1
+                             or args.layer_effect_layers != sorted(set(args.layer_effect_layers))):
+        parser.error("Effect losses require a damped teacher, ordered readout layers, no student slots, and TP 1")
+    if use_layer_effect:
+        layers = args.layer_effect_layers
+        if use_round_effect:
+            if layers != list(range(args.loop_end_layer, args.loop_end_layer + args.loop_count)):
+                parser.error("Round effects need one consecutive student readout per teacher round starting at block exit")
+        elif not layers or not args.loop_start_layer < layers[0] or layers[-1] != args.loop_end_layer:
+            parser.error("Layer effects require ordered block exits ending at the block output")
+    if args.block_state_shuffle_seed is not None and (not args.block_state_cache or args.block_state_rounds):
+        parser.error("Block-state shuffling needs a cache with fixed teacher deltas")
+    if args.block_state_target_mode == "absolute" and (
+        not args.block_state_cache or args.block_state_rounds or args.block_state_shuffle_seed is not None
+    ):
+        parser.error("Absolute block-state supervision needs a fixed final-round cache without shuffling")
+    if args.block_state_rounds:
+        from loop_jev.training.block_state_cache import valid_target_rounds
+
+        if (not args.block_state_cache or len(args.block_state_rounds) != args.epochs
+                or not valid_target_rounds(args.block_state_rounds, args.loop_count)):
+            parser.error("Block-state curriculum needs a cache and one increasing target round per epoch, "
+                         "starting above 1 and ending at the final teacher round")
     if args.loop_teacher_model and not any((args.logit_loss_weight, args.hidden_loss_weight,
-                                            args.process_loss_weight)):
-        parser.error("Loop-teacher distillation needs a logit, hidden, or process loss")
+                                            args.process_loss_weight, args.block_state_cache)):
+        parser.error("Loop-teacher distillation needs a logit, hidden, process, or cached block-state loss")
     if args.delta_loss_weight < 0:
         parser.error("--delta-loss-weight must be nonnegative")
     if args.delta_loss_weight > 0 and (args.transition_type != "linear-delta" or args.process_loss_weight > 0):
@@ -212,7 +442,7 @@ def main():
     import torch.nn.functional as F
     from torch.distributed.tensor import DTensor
     from torch.utils.data import DataLoader, Dataset, DistributedSampler
-    from transformers import AutoModelForCausalLM, AutoTokenizer, DistributedConfig
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DistributedConfig
     from tqdm.auto import tqdm
 
     @torch.no_grad()
@@ -263,6 +493,9 @@ def main():
         candidate_ids.append(ids[0])
 
     use_loop_teacher = args.loop_teacher_model is not None
+    teacher_config = (AutoConfig.from_pretrained(args.loop_teacher_model, trust_remote_code=False)
+                      if use_loop_teacher else None)
+    teacher_slots = getattr(teacher_config, "latent_slots", 0) or 0
     use_delta = args.delta_loss_weight > 0
     use_process = not use_loop_teacher and (args.process_loss_weight > 0 or use_delta)
 
@@ -280,11 +513,16 @@ def main():
                 f"({label_chars[i]}) {option}" for i, option in enumerate(row["options"])
             )
             user_content = f"Question: {row['question']}\nOptions:\n{options}"
-            prompt_ids = tokenizer.apply_chat_template(
-                [{"role": "user", "content": user_content}], tokenize=True,
-                return_dict=False, add_generation_prompt=True, enable_thinking=False,
-            )
-            rationale = remove_answer_disclosure(row.get("rationale", ""))
+            if use_option_workspace:
+                prompt_ids, option_spans = encode_option_prompt(tokenizer, row)
+            elif args.loop_staged_handoff:
+                prompt_ids, option_start = encode_handoff_prompt(tokenizer, row['question'], user_content)
+            else:
+                prompt_ids = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_content}], tokenize=True,
+                    return_dict=False, add_generation_prompt=True, enable_thinking=False,
+                )
+            rationale = "" if args.loop_removal else remove_answer_disclosure(row.get("rationale", ""))
             rationale_ids = tokenizer.encode(rationale, add_special_tokens=False)
 
             if args.latent_slots:
@@ -310,9 +548,13 @@ def main():
                     process_truncated = True
                 if not steps:
                     rationale_ids = []
-            teacher_ids = student_ids if use_loop_teacher else make_teacher_prefix(rationale_ids)
+            if teacher_slots:
+                from loop_jev.training.latent_kv import append_workspace
+                teacher_ids = append_workspace(prompt_ids, tokenizer, teacher_slots)
+            else:
+                teacher_ids = student_ids if use_loop_teacher else make_teacher_prefix(rationale_ids)
             was_truncated = process_truncated or len(teacher_ids) > args.max_length
-            while len(teacher_ids) > args.max_length and rationale_ids:
+            while not use_loop_teacher and len(teacher_ids) > args.max_length and rationale_ids:
                 overflow = len(teacher_ids) - args.max_length
                 del rationale_ids[max(0, len(rationale_ids) - max(overflow, 1)):]
                 teacher_ids = make_teacher_prefix(rationale_ids)
@@ -325,8 +567,16 @@ def main():
                 "target": row["gold_index"],
                 "option_count": len(row["options"]),
             }
-            if use_kv:
+            if use_condition_pairs:
+                item["pair_id"] = row.get("pair_id")
+            if use_option_workspace:
+                item["option_spans"] = option_spans
+            if args.loop_staged_handoff:
+                item["handoff_option_start"] = option_start
+            if use_kv or args.block_state_cache or use_layer_effect:
                 item["id"] = row["id"]
+            if use_layer_effect and item["option_count"] != 4:
+                raise ValueError("Layer effect supervision requires four answer options")
             if use_loop_cot:
                 item["loop_cot_targets"] = round_targets(
                     rationale_ids, args.loop_cot_tokens, order=args.loop_cot_order,
@@ -335,6 +585,15 @@ def main():
             if use_query:
                 from loop_jev.training.workspace_query import encode_queries
                 item["query_ids"], item["query_targets"] = encode_queries(tokenizer, rationale)
+            if use_dependency:
+                from loop_jev.training.workspace_dependency import encode_dependency
+                item["dependency_input_ids"], item["dependency_targets"] = encode_dependency(tokenizer, rationale)
+            if use_program:
+                if bidirectional:
+                    item["program_targets"] = compile_targets(row)
+                else:
+                    program = compile_program(row)
+                    item["program_targets"] = program.targets() if program is not None else None
             if use_text:
                 from loop_jev.training.progressive_text import encode_trajectories
                 item["trajectories"] = encode_trajectories(
@@ -370,6 +629,15 @@ def main():
             prefix = name.removesuffix("_input_ids")
             batch[f"{prefix}_input_ids"] = torch.tensor(ids, dtype=torch.long)
             batch[f"{prefix}_attention_mask"] = torch.tensor(masks, dtype=torch.long)
+        if args.block_state_cache:
+            base, targets = zip(*(item["block_state"] for item in examples), strict=True)
+            if args.block_state_target_mode == "delta":
+                batch["block_state_base"] = torch.stack(base)
+            batch["block_state_target"] = torch.stack(
+                [target[epoch] for target in targets] if args.block_state_rounds else targets,
+            )
+        if use_layer_effect:
+            batch["layer_effect_target"] = torch.stack([item["layer_effect"] for item in examples])
         if use_process:
             batch["process_valid"] = torch.tensor([item["process_valid"] for item in examples])
         if use_text:
@@ -383,16 +651,97 @@ def main():
         if use_query:
             for key in ("query_ids", "query_targets"):
                 batch[key] = torch.tensor([item[key] for item in examples], dtype=torch.long)
+        if use_program:
+            targets = [item["program_targets"] for item in examples]
+            missing_target = [0.] * 9 if bidirectional else [[0., 0.]] * 3
+            batch["program_valid"] = torch.tensor([target is not None for target in targets])
+            batch["program_targets"] = torch.tensor(
+                [target if target is not None else missing_target for target in targets],
+                dtype=torch.float32,
+            )
+        if use_dependency:
+            ids = [item["dependency_input_ids"] for item in examples]
+            width = max(map(len, ids))
+            batch["dependency_input_ids"] = torch.tensor(
+                [row + [tokenizer.pad_token_id] * (width - len(row)) for row in ids], dtype=torch.long,
+            )
+            batch["dependency_mask"] = torch.tensor(
+                [[1] * len(row) + [0] * (width - len(row)) for row in ids], dtype=torch.long,
+            )
+            batch["dependency_targets"] = torch.tensor([item["dependency_targets"] for item in examples])
         batch["target"] = torch.tensor([item["target"] for item in examples], dtype=torch.long)
         batch["option_count"] = torch.tensor([item["option_count"] for item in examples], dtype=torch.long)
+        if use_condition_pairs:
+            pair_ids = [item["pair_id"] for item in examples]
+            if any(a != b for a, b in zip(pair_ids[::2], pair_ids[1::2], strict=True)):
+                raise ValueError("Condition pairs must be adjacent in every batch")
+            batch["pair_valid"] = torch.tensor([key is not None for key in pair_ids[::2]])
+        if use_option_workspace:
+            width = batch["student_input_ids"].shape[1]
+            batch["option_spans"] = pad_option_spans(
+                [item["option_spans"] for item in examples],
+                [width - len(item["student_input_ids"]) for item in examples],
+            )
+        if args.loop_staged_handoff:
+            width = batch["student_input_ids"].shape[1]
+            batch["handoff_option_start"] = torch.tensor([
+                item["handoff_option_start"] + width - len(item["student_input_ids"]) for item in examples
+            ], dtype=torch.long)
         return batch
 
     rows = read_rows(args.train)
     if args.max_train_examples and len(rows) > args.max_train_examples:
-        selection = random.Random(args.seed).sample(range(len(rows)), args.max_train_examples)
+        if use_condition_pairs:
+            raise ValueError("Prepare the paired dataset at the final training size before training")
+        selection = random.Random(train_sample_seed).sample(range(len(rows)), args.max_train_examples)
         rows = [rows[index] for index in selection]
+    condition_groups = pair_groups(rows) if use_condition_pairs else None
+    if use_condition_pairs and len(condition_groups) % args.data_parallel_size:
+        raise ValueError("Condition groups must be divisible by the data parallel size")
     dataset = AnswerSlotDataset(rows)
     encoded = [dataset[index] for index in range(len(dataset))]
+    if use_layer_effect:
+        from loop_jev.training.block_layer_effect import LayerEffectReadout, layer_effect_targets
+        from loop_jev.training.block_state_cache import cache_metadata
+
+        effect_metadata = cache_metadata(train=args.train, model=args.model, teacher=args.loop_teacher_model,
+                                         layer=args.loop_end_layer, seed=train_sample_seed,
+                                         rounds=args.loop_count, damping_step=args.loop_damping_step)
+        ids = [item["id"] for item in encoded]
+        if use_round_effect:
+            from loop_jev.training.block_round_effect import round_effect_targets
+
+            effects, effect_scale = round_effect_targets(
+                args.layer_effect_cache, dict(effect_metadata, start_layer=args.loop_start_layer),
+                ids, args.layer_effect_mode,
+            )
+        else:
+            effects, effect_scale = layer_effect_targets(
+                args.layer_effect_cache, effect_metadata, ids, args.layer_effect_layers, args.layer_effect_mode,
+            )
+        for item in encoded:
+            item["layer_effect"] = effects[item["id"]]
+    if args.block_state_cache:
+        from loop_jev.training.block_state_cache import cache_metadata, capture_answer, load_cache, state_loss
+
+        metadata = cache_metadata(train=args.train, model=args.model, teacher=args.loop_teacher_model,
+                                  layer=args.loop_end_layer, seed=train_sample_seed,
+                                  rounds=args.loop_count, damping_step=args.loop_damping_step)
+        cache, cached_states = load_cache(args.block_state_cache, metadata, [item["id"] for item in encoded],
+                                          target_rounds=args.block_state_rounds,
+                                          target_mode=args.block_state_target_mode)
+        if args.block_state_shuffle_seed is not None:
+            from loop_jev.training.block_state_cache import shuffle_targets_within_label
+
+            labels = {item["id"]: item["target"] for item in encoded}
+            cached_states = shuffle_targets_within_label(cached_states, labels, args.block_state_shuffle_seed)
+            if rank == 0:
+                print(f"block_state shuffled {len(labels)} targets within gold option groups "
+                      f"with seed={args.block_state_shuffle_seed}", flush=True)
+        block_state_projection = cache["projection"].to(local_rank)
+        block_state_scale = cache["scale"]
+        for item in encoded:
+            item["block_state"] = cached_states[item["id"]]
     kv_targets = None
     if use_kv:
         from loop_jev.training.latent_kv import load_cache
@@ -403,6 +752,20 @@ def main():
         )
     truncated_examples = dataset.truncated
     query_coverage = None
+    dependency_coverage = None
+    program_coverage = None
+    if use_program:
+        program_coverage = sum(item["program_targets"] is not None for item in encoded)
+        if not program_coverage:
+            raise ValueError("Program composition requires verifiable multi-step calculator traces")
+        if rank == 0:
+            print(f"program_{args.program_objective}_coverage={program_coverage}/{len(encoded)}", flush=True)
+    if use_dependency:
+        dependency_coverage = sum(item["dependency_targets"][0][0] >= 0 for item in encoded)
+        if not dependency_coverage:
+            raise ValueError("Workspace dependency requires verified pairs of calculator annotations")
+        if rank == 0:
+            print(f"workspace_dependency_coverage={dependency_coverage}/{len(encoded)}", flush=True)
     if use_query:
         query_coverage = sum(any(any(ids) for ids in item["query_ids"]) for item in encoded)
         if not query_coverage:
@@ -452,7 +815,7 @@ def main():
         return captures, handles
 
     use_teacher = (args.logit_loss_weight > 0 or args.hidden_loss_weight > 0
-                   or use_process or use_loop_teacher or use_suffix)
+                   or args.process_loss_weight > 0 or use_process or use_suffix)
     use_hidden = args.hidden_loss_weight > 0
     hidden_layer_count = None
     hidden_layers = None
@@ -470,17 +833,19 @@ def main():
         if use_loop_teacher:
             if getattr(teacher_base.config, "loop_transition_rank", 0) != 0:
                 raise ValueError("Loop teacher checkpoint must not contain a transition head")
-            from loop_jev.looping import enable_looping
-            enable_looping(
-                teacher_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
-                damping=args.loop_damping, collect_all_readouts=False,
-            )
+            from loop_jev.looping import damped_update, enable_looping
+            if not args.disable_teacher_looping:
+                enable_looping(
+                    teacher_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
+                    damping=args.loop_damping, collect_all_readouts=False,
+                    damping_step=args.loop_damping_step,
+                )
             if args.process_loss_weight > 0:
                 def capture_loop_state(_module, inputs, output):
                     previous = inputs[0][:, -1, :]
                     block_output = output[0] if isinstance(output, (tuple, list)) else output
                     block_output = block_output[:, -1, :]
-                    state = (previous + (block_output - previous) / args.loop_count
+                    state = (damped_update(previous, block_output, args.loop_count, args.loop_damping_step)
                              if args.loop_damping else block_output)
                     teacher_loop_states.append(state.detach().clone())
 
@@ -516,24 +881,47 @@ def main():
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
 
-    from transformers import AutoConfig
     from loop_jev.transition import load_loop_model
     student_config = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+    if args.loop_removal:
+        from loop_jev.training.latent_kv import marker_token_id
+        from loop_jev.training.loop_removal import configure_stage, removal_schedule, trim_workspace, validate_checkpoint
+
+        removal_marker = marker_token_id(tokenizer)
+        removal_suffix = len(tokenizer.encode("Answer: (", add_special_tokens=False))
+        validate_checkpoint(student_config, removal_marker)
     if getattr(student_config, "loop_transition_rank", 0) != 0:
         raise ValueError("Start this experiment from a base checkpoint without a transition head")
     student_config.loop_transition_rank = args.transition_rank
     student_config.loop_transition_scope = args.transition_scope
     student_config.loop_transition_type = args.transition_type
+    student_config.option_workspace = use_option_workspace
+    student_config.loop_refinement_token_ids = candidate_ids if args.loop_answer_refinement else None
+    student_config.latent_core_width = args.latent_core_width
+    if args.latent_core_width:
+        student_config.latent_core_suffix = len(tokenizer.encode("Answer: (", add_special_tokens=False))
+        student_config.latent_slots = args.latent_slots
+        student_config.loop_count = args.loop_count
+    if use_option_workspace:
+        student_config.option_workspace_suffix = len(tokenizer.encode("Answer: (", add_special_tokens=False))
+    if args.loop_schedule == "layerwise-gated":
+        student_config.loop_schedule = args.loop_schedule
+        student_config.loop_start_layer = args.loop_start_layer
+        student_config.loop_end_layer = args.loop_end_layer
+        student_config.loop_count = args.loop_count
     student_base = load_loop_model(
         args.model, config=student_config, dtype=torch.float32, attn_implementation="sdpa", trust_remote_code=False,
         distributed_config=distributed_config,
     )
     if use_loop_teacher and (
-        teacher_base.config.num_hidden_layers != student_base.config.num_hidden_layers
-        or teacher_base.config.hidden_size != student_base.config.hidden_size
+        teacher_config.num_hidden_layers != student_base.config.num_hidden_layers
+        or teacher_config.hidden_size != student_base.config.hidden_size
     ):
         raise ValueError("Loop teacher and student must have matching depth and hidden size")
-    if not use_loop_teacher:
+    if args.latent_core_width:
+        from loop_jev.latent_core import enable_latent_core
+        enable_latent_core(student_base)
+    elif not use_loop_teacher and not args.loop_removal:
         from loop_jev.looping import enable_looping
         workspace_slice = None
         if use_loop_cot:
@@ -541,17 +929,28 @@ def main():
                 student_base, args.loop_cot_tokens,
                 len(tokenizer.encode("Answer: (", add_special_tokens=False)),
             )
-        if use_query:
+        if use_query or use_dependency:
             suffix = len(tokenizer.encode("Answer: (", add_special_tokens=False))
             workspace_slice = slice(-args.latent_slots - suffix, -suffix)
+        if use_program and args.loop_count == 3:
+            workspace_slice = slice(-1, None)
         enable_looping(
             student_base, args.loop_start_layer, args.loop_end_layer, args.loop_count,
             damping=args.loop_damping,
+            damping_step=args.loop_damping_step,
+            schedule=args.loop_schedule,
             collect_all_readouts=args.answer_supervision == "every-loop" or args.process_loss_weight > 0,
             collect_updates=use_delta,
             workspace_slice=workspace_slice,
             carry_workspace=(args.latent_slots, len(tokenizer.encode("Answer: (", add_special_tokens=False)))
             if args.loop_carry_workspace else None,
+            multiscale_workspace=(args.loop_multiscale_workspace,
+                                  len(tokenizer.encode("Answer: (", add_special_tokens=False)))
+            if args.loop_multiscale_workspace else None,
+            staged_handoff=(args.latent_slots, len(tokenizer.encode("Answer: (", add_special_tokens=False)))
+            if args.loop_staged_handoff else None,
+            evidence_reread=(args.latent_slots, len(tokenizer.encode("Answer: (", add_special_tokens=False)))
+            if args.loop_evidence_reread else None,
         )
     student_base.config.use_cache = False
     student_base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -586,6 +985,12 @@ def main():
         student_hidden_capture, student_hook_handles = capture_answer_hidden_states(
             student_base, hidden_layers,
         )
+    if args.block_state_cache:
+        block_state_capture, _block_state_hook = capture_answer(student_base, args.loop_end_layer)
+    if use_layer_effect:
+        if args.layer_effect_layers[-1] > hidden_layer_count:
+            raise ValueError("Effect readout layer is outside the student decoder")
+        effect_capture, _effect_hooks = capture_answer_hidden_states(student_base, args.layer_effect_layers)
     student_loop_capture = {}
     student_loop_hooks = []
     student_loop_layers = []
@@ -613,15 +1018,34 @@ def main():
         if len(suffix_layers) != 3:
             raise ValueError("Suffix curriculum requires at least three student layers")
         suffix_capture, suffix_hooks = capture_answer_hidden_states(student_base, suffix_layers)
+    program_layers, program_capture = None, {}
+    if use_program and args.loop_count == 1:
+        program_layers = [round(hidden_layer_count * fraction / 7) for fraction in (3, 4.5, 6)]
+        if len(set(program_layers)) != 3 or program_layers[0] < 1:
+            raise ValueError("Program supervision requires three distinct readout layers")
+        program_capture, _program_hooks = capture_answer_hidden_states(student_base, program_layers)
     student = student_base
     # from_pretrained() starts in eval mode; checkpointing requires training mode.
     student.train()
 
     transition_parameters = [p for name, p in student.named_parameters()
                              if name.startswith("loop_transition.")]
+    refinement_parameters = [p for name, p in student.named_parameters()
+                             if name.startswith("loop_answer_refinement.")]
+    core_parameters = [p for name, p in student.named_parameters() if name.startswith("latent_core.")]
     base_parameters = [p for name, p in student.named_parameters()
-                       if not name.startswith("loop_transition.")]
+                       if not name.startswith(("loop_transition.", "loop_answer_refinement.", "latent_core."))]
     parameter_groups = [{"params": base_parameters, "lr": args.learning_rate}]
+    if use_layer_effect:
+        from torch.nn.parallel import DistributedDataParallel
+
+        effect_readout = DistributedDataParallel(
+            LayerEffectReadout(student_base.config.hidden_size, len(args.layer_effect_layers)).to(local_rank),
+            device_ids=[local_rank],
+        )
+        parameter_groups.append({"params": list(effect_readout.parameters()), "lr": 3e-4})
+    if core_parameters:
+        parameter_groups.append({"params": core_parameters, "lr": args.latent_core_learning_rate})
     if use_query:
         from torch.nn.parallel import DistributedDataParallel
         from loop_jev.training.workspace_query import WorkspaceQueryReadout, query_loss
@@ -629,9 +1053,25 @@ def main():
             WorkspaceQueryReadout(student_base.config.hidden_size).to(local_rank), device_ids=[local_rank],
         )
         parameter_groups.append({"params": list(query_readout.parameters()), "lr": 3e-4})
+    if use_dependency:
+        from torch.nn.parallel import DistributedDataParallel
+        from loop_jev.training.workspace_dependency import DependencyReadout, dependency_loss
+        dependency_readout = DistributedDataParallel(
+            DependencyReadout(student_base.config.hidden_size).to(local_rank), device_ids=[local_rank],
+        )
+        parameter_groups.append({"params": list(dependency_readout.parameters()), "lr": 3e-4})
+    if use_program:
+        from torch.nn.parallel import DistributedDataParallel
+        program_readout = DistributedDataParallel(
+            ProgramReadout(student_base.config.hidden_size).to(local_rank), device_ids=[local_rank],
+        )
+        parameter_groups.append({"params": list(program_readout.parameters()), "lr": 3e-4})
     if transition_parameters:
         parameter_groups.append({"params": transition_parameters,
                                  "lr": args.transition_learning_rate})
+    refinement_learning_rate = 1e-4 if args.loop_answer_refinement else None
+    if refinement_parameters:
+        parameter_groups.append({"params": refinement_parameters, "lr": refinement_learning_rate})
     parameters_for_clipping = [parameter for group in parameter_groups for parameter in group["params"]]
     optimizer = torch.optim.AdamW(parameter_groups, weight_decay=0.01, foreach=False)
     samples_per_rank = len(encoded) // args.data_parallel_size
@@ -641,6 +1081,11 @@ def main():
     if total_steps < (4 if use_text else 1):
         raise ValueError("Not enough optimizer updates for the selected training mode")
     update_step = 0
+    removal_stages = {step: (rounds, slots) for step, rounds, slots in removal_schedule(
+        args.loop_removal, steps_per_epoch, final_rounds=args.loop_removal_final_rounds,
+        keep_slots=args.loop_removal_keep_slots,
+    )} if args.loop_removal else {}
+    removal_history = []
     text_stage_history = []
     previous_text_stage = None
     text_generator = torch.Generator().manual_seed(args.seed + 1000 + rank)
@@ -659,15 +1104,22 @@ def main():
     torch.cuda.reset_peak_memory_stats()
     training_started = time.monotonic()
     for epoch in range(args.epochs):
+        block_state_round = (args.block_state_rounds[epoch] if args.block_state_rounds else args.loop_count
+                             ) if args.block_state_cache else None
+        if block_state_round is not None and rank == 0:
+            print(f"block_state epoch={epoch + 1} target_round={block_state_round} "
+                  f"mode={args.block_state_target_mode}", flush=True)
         suffix_stage = min(2, epoch * 3 // args.epochs)
         if use_suffix and rank == 0:
             print(f"suffix_stage={suffix_stage + 1} latent_layers={suffix_layers[:suffix_stage + 1]}", flush=True)
         sampler = DistributedSampler(
-            EncodedDataset(), num_replicas=args.data_parallel_size,
+            condition_groups if use_condition_pairs else EncodedDataset(), num_replicas=args.data_parallel_size,
             rank=rank // args.tensor_parallel_size,
             shuffle=True, seed=args.seed, drop_last=True,
         )
         sampler.set_epoch(epoch)
+        if use_condition_pairs:
+            sampler = [index for group in sampler for index in condition_groups[group]]
         loader = DataLoader(
             EncodedDataset(), batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
         )
@@ -676,10 +1128,19 @@ def main():
         epoch_suffix_sum = torch.zeros((), device=local_rank)
         epoch_kv_sum = torch.zeros((), device=local_rank)
         epoch_cot_sum = torch.zeros((), device=local_rank)
+        if use_depth:
+            epoch_depth_sums = torch.zeros(5, device=local_rank)
         if use_query:
             epoch_query_sum = torch.zeros((), device=local_rank)
             epoch_query_stats = torch.zeros(args.loop_count + 2, dtype=torch.long, device=local_rank)
-        epoch_sums = torch.zeros(6, device=local_rank, dtype=torch.float32)
+        if use_dependency:
+            epoch_dependency_sum = torch.zeros((), device=local_rank)
+            epoch_dependency_stats = torch.zeros(6, dtype=torch.long, device=local_rank)
+        if use_program:
+            epoch_program_stats = torch.zeros(3, device=local_rank)
+        if use_condition_pairs:
+            epoch_pair_stats = torch.zeros(3, device=local_rank)
+        epoch_sums = torch.zeros(8, device=local_rank, dtype=torch.float32)
         progress = tqdm(
             loader, desc=f"epoch {epoch + 1}/{args.epochs}", unit="batch",
             dynamic_ncols=True, disable=rank != 0,
@@ -700,10 +1161,24 @@ def main():
             suffix_sequences = batch.pop("suffixes", None)
             kv_ids = batch.pop("kv_ids", None)
             batch = {key: value.to(local_rank) for key, value in batch.items()}
+            state_base = batch.pop("block_state_base", None)
+            state_target = batch.pop("block_state_target", None)
+            effect_target = batch.pop("layer_effect_target", None)
             cot_targets = batch.pop("loop_cot_targets", None)
+            pair_valid = batch.pop("pair_valid", None)
             if use_query:
                 query_ids = batch.pop("query_ids")
                 query_targets = batch.pop("query_targets")
+            if use_program:
+                program_targets = batch.pop("program_targets")
+                program_valid = batch.pop("program_valid")
+            dependency_kwargs = {}
+            if use_dependency:
+                probe = batch_index % 16 == 0
+                dependency_kwargs["dependency_input"] = (
+                    batch.pop("dependency_input_ids"), batch.pop("dependency_mask"), probe,
+                )
+                dependency_targets = batch.pop("dependency_targets")
             teacher_batch = {
                 "input_ids": batch.pop("teacher_input_ids"),
                 "attention_mask": batch.pop("teacher_attention_mask"),
@@ -712,8 +1187,22 @@ def main():
                 "input_ids": batch.pop("student_input_ids"),
                 "attention_mask": batch.pop("student_attention_mask"),
             }
-            if use_loop_teacher:
-                teacher_batch = student_batch
+            if args.loop_removal:
+                if update_step in removal_stages:
+                    rounds, slots = removal_stages.pop(update_step)
+                    final_step = args.loop_removal_final_step if rounds == args.loop_removal_final_rounds else None
+                    configure_stage(student_base, rounds, slots, removal_marker, damping_step=final_step)
+                    stage = dict(first_update=update_step + 1, rounds=rounds, latent_slots=slots,
+                                 damping_step=student_base.config.loop_damping_step)
+                    removal_history.append(stage)
+                    if rank == 0:
+                        print(f"loop_removal {stage}", flush=True)
+                student_batch = trim_workspace(student_batch, slots, removal_suffix, args.latent_slots)
+            if use_option_workspace:
+                student_batch["option_spans"] = batch.pop("option_spans")
+                student_batch["option_vocab_logits"] = args.logit_loss_weight > 0
+            if args.loop_staged_handoff:
+                student_batch["handoff_option_start"] = batch.pop("handoff_option_start")
             accumulation_remainder = len(loader) % args.gradient_accumulation_steps
             group_size = (
                 accumulation_remainder
@@ -769,36 +1258,99 @@ def main():
             kv_capture.clear()
             if use_hidden:
                 student_hidden_capture.clear()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                student_outputs = student(
-                    **student_batch, logits_to_keep=1, output_hidden_states=False,
-                )
             valid_options = (
                 torch.arange(len(label_chars), device=local_rank)[None, :]
                 < option_counts[:, None]
             )
+            if use_depth:
+                from loop_jev.training.depth_supervision import adjacent_penalty, depth_answer_ce
+
+                depth_reference = None
+                shallow_objective = torch.zeros((), device=local_rank)
+                # Each depth traverses the whole model. Release its graph before the next depth.
+                for depth in (1, 2):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        shallow = student(
+                            **student_batch, logits_to_keep=1, loop_depth=depth, output_hidden_states=False,
+                        )
+                    shallow_ce = depth_answer_ce(shallow.logits, candidate_ids, valid_options, targets)
+                    branch_loss = 0.25 * shallow_ce.mean()
+                    if depth_reference is not None:
+                        penalty = adjacent_penalty(depth_reference, shallow_ce)
+                        branch_loss = branch_loss + 0.125 * penalty
+                        epoch_depth_sums[3] += penalty.detach()
+                    if not torch.isfinite(branch_loss):
+                        raise FloatingPointError(f"Non-finite loss at layerwise depth {depth}")
+                    (branch_loss / group_size).backward()
+                    depth_reference = shallow_ce.detach()
+                    epoch_depth_sums[depth - 1] += depth_reference.mean()
+                    shallow_objective += branch_loss.detach()
+                    student_base.model.loop_hidden_states = []
+                    del shallow, shallow_ce, branch_loss
+                    if depth == 2:
+                        del penalty
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                if args.loop_answer_refinement:
+                    dependency_kwargs["refine_answer_scores"] = True
+                student_outputs = student(
+                    **student_batch, logits_to_keep=1, output_hidden_states=False, **dependency_kwargs,
+                )
+                if use_layer_effect:
+                    layer_effect_loss = effect_readout(
+                        [effect_capture.pop(layer) for layer in args.layer_effect_layers], effect_target, effect_scale,
+                    )
+                if use_dependency:
+                    dependency_logits, masked_dependency_logits = dependency_readout(
+                        *student_base.model.loop_dependency_states,
+                    )
+                if use_program:
+                    program_states = ([program_capture[layer] for layer in program_layers]
+                                      if program_layers is not None else
+                                      [state[:, 0, :] for state in student_base.model.loop_workspace_states])
+                    program_predictions = program_readout(program_states)
+            program_aux = torch.zeros((), device=local_rank)
+            if use_program:
+                program_aux, program_stats = program_loss(program_predictions, program_targets, program_valid)
+                epoch_program_stats += program_stats
+            dependency_aux = torch.zeros((), device=local_rank)
+            if use_dependency:
+                dependency_aux, dependency_stats = dependency_loss(
+                    dependency_logits, masked_dependency_logits, dependency_targets,
+                )
+                epoch_dependency_sum += dependency_aux.detach()
+                epoch_dependency_stats += dependency_stats
             answer_losses = []
             logit_losses = []
             teacher_probs = (
                 F.softmax(teacher_logits / temperature, dim=-1)
                 if args.logit_loss_weight > 0 else None
             )
-            loop_readouts = ([None] if use_loop_teacher
+            loop_readouts = ([None] if use_loop_teacher or args.loop_removal
                              else student_base.model.loop_hidden_states)
-            if args.answer_supervision == "final-loop" and not use_loop_teacher:
+            if args.answer_supervision == "final-loop":
                 loop_readouts = loop_readouts[-1:]
             for loop_hidden in loop_readouts:
                 # Reuse the root forward's final logits. Re-entering a tied
                 # FSDP LM head alone skips its paired embedding forward.
-                student_logits = (
-                    student_outputs.logits[:, -1, :].float()
-                    if args.answer_supervision == "final-loop"
-                    else student_base.lm_head(loop_hidden[:, -1, :]).float()
-                )
-                option_logits = student_logits[:, candidate_ids]
-                option_logits = option_logits.masked_fill(
-                    ~valid_options, torch.finfo(option_logits.dtype).min,
-                )
+                if args.loop_answer_refinement:
+                    student_logits = student_outputs.answer_token_logits[:, -1, :].float()
+                    option_logits = student_outputs.logits.masked_fill(~valid_options, float("-inf"))
+                    base_options = student_logits[:, candidate_ids].masked_fill(~valid_options, float("-inf"))
+                    answer_losses.append(F.cross_entropy(base_options, targets))
+                elif use_option_workspace:
+                    option_logits = student_outputs.logits.float()
+                    if teacher_probs is not None:
+                        student_logits = student_outputs.answer_token_logits[:, -1, :].float()
+                else:
+                    student_logits = (
+                        student_outputs.logits[:, -1, :].float()
+                        if args.answer_supervision == "final-loop"
+                        else student_base.lm_head(loop_hidden[:, -1, :]).float()
+                    )
+                    option_logits = student_logits[:, candidate_ids]
+                    option_logits = option_logits.masked_fill(
+                        ~valid_options, torch.finfo(option_logits.dtype).min,
+                    )
                 answer_losses.append(F.cross_entropy(option_logits, targets))
                 if teacher_probs is not None:
                     student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
@@ -809,7 +1361,17 @@ def main():
                     else:
                         loop_logit_loss = -(teacher_probs * student_log_probs).sum(dim=-1).mean()
                     logit_losses.append(loop_logit_loss * (temperature ** 2))
-            answer_loss = torch.stack(answer_losses).mean()
+            # Keep the first-pass CE/KL at baseline strength; add CE for the corrected scores.
+            answer_loss = (torch.stack(answer_losses).sum() if args.loop_answer_refinement
+                           else torch.stack(answer_losses).mean())
+            if use_condition_pairs:
+                condition_loss, pair_stats = paired_margin_loss(option_logits, targets, pair_valid)
+                epoch_pair_stats += pair_stats
+            if use_depth:
+                final_depth_ce = depth_answer_ce(student_outputs.logits, candidate_ids, valid_options, targets)
+                depth_penalty = adjacent_penalty(depth_reference, final_depth_ce)
+                epoch_depth_sums[2] += final_depth_ce.detach().mean()
+                epoch_depth_sums[4] += depth_penalty.detach()
             logit_loss = (
                 torch.stack(logit_losses).mean()
                 if logit_losses else answer_loss.new_zeros(())
@@ -823,6 +1385,11 @@ def main():
             hidden_loss = (
                 torch.stack(hidden_losses).mean() if hidden_losses else answer_loss.new_zeros(())
             )
+            block_state_loss = (state_loss(block_state_capture.pop("answer"), state_base, state_target,
+                                          block_state_projection, block_state_scale)
+                                if args.block_state_cache else answer_loss.new_zeros(()))
+            if not use_layer_effect:
+                layer_effect_loss = answer_loss.new_zeros(())
             process_loss = (
                 process_alignment_loss(
                     ([student_loop_capture[index] for index in student_loop_layers]
@@ -873,23 +1440,41 @@ def main():
                 args.kv_loss_weight * kv_loss + args.suffix_loss_weight * suffix_loss
                 + args.loop_cot_weight * cot_loss
                 + args.workspace_query_weight * workspace_query_loss
+                + args.workspace_dependency_weight * dependency_aux
+                + args.program_composition_weight * program_aux
                 + answer_loss + args.logit_loss_weight * logit_loss
                 + args.hidden_loss_weight * hidden_loss
                 + args.process_loss_weight * process_loss
                 + args.delta_loss_weight * delta_loss
+                + args.block_state_weight * block_state_loss
+                + args.layer_effect_weight * layer_effect_loss
             )
+            if use_depth:
+                loss = loss + 0.125 * depth_penalty
+            if use_condition_pairs:
+                loss = loss + args.condition_pair_weight * condition_loss
             scaled_loss = ((1 - args.nonloop_loss_weight) if use_nonloop else 1) * loss / group_size
             if not torch.isfinite(scaled_loss):
                 raise FloatingPointError(f"Non-finite loss at epoch={epoch + 1}, batch={batch_index + 1}")
             scaled_loss.backward()
+            if args.block_state_cache:
+                block_state_capture.clear()
+            if use_layer_effect:
+                effect_capture.clear()
             if not use_loop_teacher:
                 student_base.model.loop_hidden_states = []
                 student_base.model.loop_updates = []
             student_loop_capture.clear()
             suffix_capture.clear()
             kv_capture.clear()
-            if use_loop_cot or use_query:
+            program_capture.clear()
+            if use_program:
+                del program_states, program_predictions
+            if use_loop_cot or use_query or use_dependency or (use_program and args.loop_count == 3):
                 student_base.model.loop_workspace_states = []
+            if use_dependency:
+                student_base.model.loop_dependency_states = None
+                del dependency_logits, masked_dependency_logits
             epoch_suffix_sum += suffix_loss.detach()
             epoch_kv_sum += kv_loss.detach()
             epoch_cot_sum += cot_loss.detach()
@@ -951,9 +1536,12 @@ def main():
                     + args.nonloop_loss_weight * (nonloop_answer_loss.detach()
                     + args.logit_loss_weight * nonloop_logit_loss.detach())
                     + args.progressive_text_weight * text_loss.detach())
+            if use_depth:
+                loss = loss + shallow_objective
             epoch_sums += torch.stack([
                 answer_loss.detach(), logit_loss.detach(), hidden_loss.detach(), loss.detach(),
-                process_loss.detach(), delta_loss.detach(),
+                process_loss.detach(), delta_loss.detach(), block_state_loss.detach(),
+                layer_effect_loss.detach(),
             ])
             if sync_now:
                 update_step += 1
@@ -1000,11 +1588,27 @@ def main():
         ], device=local_rank, dtype=torch.float64)
         dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
         training_history.append(dict(zip(
-            ("ce", "kl", "hidden", "total", "process", "delta"), mean_losses,
+            ("ce", "kl", "hidden", "total", "process", "delta", "block_state", "layer_effect"), mean_losses,
         ), epoch=completed_epochs, suffix=mean_suffix_loss, kv=mean_kv_loss, text=mean_text_loss,
+            block_state_target_round=block_state_round,
             loop_cot=mean_cot_loss,
             nonloop_ce=mean_nonloop[0], nonloop_kl=mean_nonloop[1],
             peak_allocated_gib=peak_memory[0].item(), peak_reserved_gib=peak_memory[1].item()))
+        if use_condition_pairs:
+            dist.all_reduce(epoch_pair_stats)
+            pair_loss, both_preferred, pair_count = epoch_pair_stats.tolist()
+            pair_metrics = dict(loss=pair_loss / pair_count, both_preferred=int(both_preferred), pairs=int(pair_count))
+            training_history[-1]["condition_pairs"] = pair_metrics
+            if rank == 0:
+                print(f"condition_pairs epoch={epoch + 1} {json.dumps(pair_metrics)}", flush=True)
+        if use_depth:
+            dist.all_reduce(epoch_depth_sums)
+            depth_metrics = (epoch_depth_sums / (len(loader) * world_size)).tolist()
+            training_history[-1]["layerwise_depth_supervision"] = dict(
+                answer_ce=depth_metrics[:3], adjacent_penalty=depth_metrics[3:],
+            )
+            if rank == 0:
+                print(f"layerwise_depth epoch={epoch + 1} ce={depth_metrics[:3]} hinge={depth_metrics[3:]}", flush=True)
         if use_query:
             dist.all_reduce(epoch_query_sum)
             dist.all_reduce(epoch_query_stats)
@@ -1018,6 +1622,32 @@ def main():
             training_history[-1]["workspace_query"] = query_metrics
             if rank == 0:
                 print(f"workspace_query epoch={epoch + 1} {json.dumps(query_metrics)}", flush=True)
+        if use_dependency:
+            dist.all_reduce(epoch_dependency_sum)
+            dist.all_reduce(epoch_dependency_stats)
+            writer, reader, count, probe_reader, masked_reader, probe_count = epoch_dependency_stats.tolist()
+            dependency_metrics = dict(
+                loss=(epoch_dependency_sum / (len(loader) * world_size)).item(),
+                writer_exact=writer / count if count else None,
+                reader_exact=reader / count if count else None,
+                covered=count,
+                probe_reader_exact=probe_reader / probe_count if probe_count else None,
+                probe_masked_reader_exact=masked_reader / probe_count if probe_count else None,
+                probe_count=probe_count,
+            )
+            training_history[-1]["workspace_dependency"] = dependency_metrics
+            if rank == 0:
+                print(f"workspace_dependency epoch={epoch + 1} {json.dumps(dependency_metrics)}", flush=True)
+        if use_program:
+            dist.all_reduce(epoch_program_stats)
+            coeff, consistency, count = epoch_program_stats.tolist()
+            fit_name = "message_loss" if bidirectional else "coefficient_loss"
+            program_metrics = {fit_name: coeff / count if count else None}
+            program_metrics.update(
+                consistency_loss=consistency / count if count else None, covered=int(count))
+            training_history[-1]["program_composition"] = program_metrics
+            if rank == 0:
+                print(f"program_composition epoch={epoch + 1} {json.dumps(program_metrics)}", flush=True)
         if rank == 0:
             print(
                 f"text={mean_text_loss:.6f} suffix={mean_suffix_loss:.6f} "
@@ -1026,11 +1656,17 @@ def main():
                 f"mean_ce={mean_losses[0]:.6f} "
                 f"mean_kl={mean_losses[1]:.6f} mean_hidden={mean_losses[2]:.6f} "
                 f"mean_total={mean_losses[3]:.6f} mean_process={mean_losses[4]:.6f} "
-                f"mean_delta={mean_losses[5]:.6f} "
+                f"mean_delta={mean_losses[5]:.6f} mean_block_state={mean_losses[6]:.6f} "
+                f"mean_layer_effect={mean_losses[7]:.6f} "
                 f"peak_allocated_gib={peak_memory[0].item():.3f} "
                 f"peak_reserved_gib={peak_memory[1].item():.3f}", flush=True,
             )
     training_seconds = time.monotonic() - training_started
+    saved_rounds = student_base.config.loop_count if args.loop_removal else args.loop_count
+    saved_slots = student_base.config.latent_slots if args.loop_removal else args.latent_slots
+    if args.loop_removal and (saved_rounds != args.loop_removal_final_rounds
+                              or saved_slots != (args.latent_slots if args.loop_removal_keep_slots else 0)):
+        raise RuntimeError("Refusing to export a loop-removal model before the final stage")
     args.output.mkdir(parents=True, exist_ok=True)
     student.save_pretrained(
         args.output, safe_serialization=True, max_shard_size="5GB",
@@ -1047,10 +1683,21 @@ def main():
             "training_history": training_history,
             "loop_start_layer": args.loop_start_layer,
             "loop_end_layer": args.loop_end_layer,
-            "loop_count": args.loop_count,
-            "loop_parameter_sharing": True if not use_loop_teacher else None,
-            "loop_damping": args.loop_damping,
+            "loop_count": saved_rounds,
+            "loop_schedule": args.loop_schedule,
+            "latent_core_width": args.latent_core_width,
+            "latent_core_learning_rate": args.latent_core_learning_rate if args.latent_core_width else None,
+            "layerwise_depth_supervision": use_depth,
+            "loop_parameter_sharing": True if not use_loop_teacher and (not args.loop_removal or saved_rounds > 1)
+            else None,
+            "loop_damping": student_base.config.loop_damping if args.loop_removal else args.loop_damping,
+            "loop_damping_step": (student_base.config.loop_damping_step if args.loop_removal
+                                  else args.loop_damping_step),
+            **({"loop_removal": args.loop_removal, "loop_removal_stages": removal_history}
+               if args.loop_removal else {}),
             "loop_carry_workspace": args.loop_carry_workspace,
+            "loop_multiscale_workspace": args.loop_multiscale_workspace,
+            "loop_evidence_reread": args.loop_evidence_reread,
             "transition_type": args.transition_type,
             "delta_loss_weight": args.delta_loss_weight,
             "delta_target": "consecutive teacher prefix answer slots at loop_end_layer output" if use_delta else None,
@@ -1062,13 +1709,16 @@ def main():
                 "between loops, after damped update; shared; zero-initialized output")
                 if args.transition_rank else None,
             "teacher": (args.loop_teacher_model if use_loop_teacher else args.model)
-            if use_teacher else None,
+            if use_teacher or args.block_state_cache else None,
+            "teacher_looping_disabled": args.disable_teacher_looping if use_loop_teacher else None,
+            "teacher_latent_slots": teacher_slots if use_loop_teacher else None,
             "train": str(args.train),
             "epochs": args.epochs,
             "completed_epochs": completed_epochs,
             "optimizer_steps": update_step,
             "lr_schedule_steps": total_steps,
             "seed": args.seed,
+            "train_sample_seed": train_sample_seed,
             "learning_rate": args.learning_rate,
             "learning_rate_schedule": "constant",
             "final_learning_rate": optimizer.param_groups[0]["lr"],
@@ -1093,21 +1743,29 @@ def main():
             "teacher_parameter_dtype": "bfloat16" if use_teacher else None,
             "logit_distillation": (
                 f"temperature-scaled {args.logit_loss_type.upper()} over the full vocabulary "
-                + ("at the final loop readout's next-answer-token position"
-                   if args.answer_supervision == "final-loop" else
+                + ("at the undamped first readout's next-answer-token position" if args.loop_answer_refinement else
+                   "at the final loop readout's next-answer-token position" if args.answer_supervision == "final-loop" else
                    "at every loop readout's next-answer-token position, averaged across loops")
             ),
             "logit_loss_type": args.logit_loss_type,
             "temperature": temperature,
             "logit_loss_weight": args.logit_loss_weight,
+            "option_workspace": use_option_workspace,
             "answer_loss": (
+                "cross-entropy over four option workspace scores" if use_option_workspace else
+                "sum of answer-letter cross-entropies at the direct and refined readouts"
+                if args.loop_answer_refinement else
                 "cross-entropy over valid answer-letter logits at the final loop readout"
                 if args.answer_supervision == "final-loop"
                 else "mean cross-entropy over valid answer-letter logits at every loop readout"
             ),
             "answer_supervision": args.answer_supervision,
+            "condition_pair_weight": args.condition_pair_weight,
+            "loop_staged_handoff": args.loop_staged_handoff,
+            "loop_answer_refinement": args.loop_answer_refinement,
+            "loop_refinement_learning_rate": refinement_learning_rate,
             "nonloop_loss_weight": args.nonloop_loss_weight,
-            "latent_slots": args.latent_slots,
+            "latent_slots": saved_slots,
             "latent_marker_token_id": getattr(student_base.config, "latent_marker_token_id", None),
             "kv_loss_weight": args.kv_loss_weight,
             "loop_cot_weight": args.loop_cot_weight,
@@ -1115,19 +1773,36 @@ def main():
             "loop_cot_tokens": args.loop_cot_tokens if use_loop_cot else None,
             "workspace_query_weight": args.workspace_query_weight,
             "workspace_query_coverage": query_coverage,
+            "workspace_dependency_weight": args.workspace_dependency_weight,
+            "workspace_dependency_coverage": dependency_coverage,
+            "program_composition_weight": args.program_composition_weight,
+            "program_objective": args.program_objective if use_program else None,
+            "program_composition_coverage": program_coverage,
+            "program_composition_readout_layers": program_layers,
             "kv_layer_0_indexed": args.kv_layer if use_kv else None,
             "kv_cache": str(args.kv_cache) if use_kv else None,
             "kv_objective": "cosine alignment of pre-RoPE normalized K and V at latent workspace positions, final loop only" if use_kv else None,
             "nonloop_objective": "same question-only input and full-rationale teacher target as final-loop; weighted CE+KL mixture, sequential backward" if use_nonloop else None,
-            "student_input": (f"question and options, {args.latent_slots} latent marker tokens, then Answer: ("
-                              if args.latent_slots else "question and options only, followed by Answer: ("),
-            "teacher_input": ("question and options only, followed by Answer: (; recurrent loop teacher"
-                              if use_loop_teacher else
-                              "question, options, and full training rationale, followed by Answer: ("),
+            "student_input": (f"question and options, {saved_slots} latent marker tokens, then Answer: ("
+                              if saved_slots
+                              else "question and options only, followed by Answer: ("),
+            "teacher_input": (
+                f"question and options, {teacher_slots} latent marker tokens, then Answer: ("
+                if teacher_slots else "question and options only, followed by Answer: ("
+                if use_loop_teacher else "question, options, and full training rationale, followed by Answer: ("
+            ) if use_teacher else None,
             "hidden_distillation": "cross-context cosine alignment at the next-answer-token position for evenly spaced transformer layers",
             "hidden_layers_1_indexed": hidden_layers,
             "hidden_layer_selection": args.hidden_layer_selection,
             "hidden_loss_weight": args.hidden_loss_weight,
+            "block_state_weight": args.block_state_weight,
+            "block_state_target_mode": args.block_state_target_mode if args.block_state_cache else None,
+            "block_state_rounds": args.block_state_rounds,
+            "block_state_shuffle_seed": args.block_state_shuffle_seed,
+            "block_state_cache": str(args.block_state_cache) if args.block_state_cache else None,
+            "layer_effect": dict(cache=str(args.layer_effect_cache), layers=args.layer_effect_layers,
+                                 mode=args.layer_effect_mode, weight=args.layer_effect_weight,
+                                 scale=effect_scale) if use_layer_effect else None,
             "process_loss_weight": args.process_loss_weight,
             "process_loss_discount": args.process_loss_discount,
             "process_distillation": (
@@ -1148,7 +1823,9 @@ def main():
             "suffix_max_tokens": args.suffix_max_tokens,
             "suffix_layers_1_indexed": suffix_layers,
             "suffix_curriculum": "1/2/3 depth states predict full/final two thirds/final third of steps; no optimizer reset" if use_suffix else None,
-            "student_inference": "single non-looped forward pass" if use_loop_teacher or use_suffix or use_text else None,
+            "student_inference": (f"{saved_rounds} block rounds" if args.loop_removal and saved_rounds > 1 else
+                                  "single non-looped forward pass"
+                                  if args.loop_removal or use_loop_teacher or use_suffix or use_text else None),
             "loop_teacher_student_layers_0_indexed": student_loop_layers if use_loop_teacher else None,
             "process_statistics": process_statistics,
             "truncated_examples": truncated_examples,

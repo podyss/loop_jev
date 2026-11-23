@@ -5,9 +5,8 @@ export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,2}"
 
 root=outputs/jev-ce-kl-4096-comparison
-prior=outputs/jev-loop-cot-comparison
 train="$root/train.jsonl"
-validation="$prior/validation.jsonl"
+test_input=data/gsm-mc/test.jsonl
 checkpoint_root="${1:-/tmp/loop-jev-$(id -u)/ce-kl-4096}"
 extra_root="${2:-/dev/shm/loop-jev-$(id -u)/ce-kl-4096}"
 experiments=(loop1 loop3 loop2 loop3-late)
@@ -16,7 +15,7 @@ declare -A starts=([loop1]=9 [loop3]=9 [loop2]=9 [loop3-late]=14)
 declare -A roots=([loop1]="$checkpoint_root" [loop3]="$checkpoint_root"
                   [loop2]="$extra_root" [loop3-late]="$extra_root")
 
-uv run python - "$train" "$validation" <<'PY'
+uv run python - "$train" "$test_input" <<'PY'
 import json
 import random
 import sys
@@ -24,18 +23,26 @@ from pathlib import Path
 
 from loop_jev.training.answer_slot_distill import read_rows
 
-train, validation = map(Path, sys.argv[1:])
+train, test_input = map(Path, sys.argv[1:])
 rows = read_rows(Path("data/gsm-mc/train.jsonl"))
-held_out = {row["id"] for row in read_rows(validation)}
+held_out = {row["id"] for row in read_rows(test_input)}
 original = random.Random(42).sample(range(len(rows)), 1024)
-assert len(held_out) == 1024 and not held_out.intersection(rows[i]["id"] for i in original)
+if len(held_out) != 1319 or held_out.intersection(row["id"] for row in rows):
+    raise ValueError("Expected 1319 disjoint GSM-MC test IDs")
+if train.is_file():
+    existing_ids = {row["id"] for row in read_rows(train)}
+    if (len(existing_ids) != 4096 or not existing_ids.issubset({row["id"] for row in rows})
+            or not {rows[i]["id"] for i in original}.issubset(existing_ids)):
+        raise ValueError(f"Invalid existing 4096-example training sample: {train}")
+    print(f"Reusing the existing training sample: {train}")
+    sys.exit(0)
 original_set = set(original)
 available = [i for i, row in enumerate(rows) if i not in original_set and row["id"] not in held_out]
 indices = original + random.Random(43).sample(available, 3072)
 assert len({rows[i]["id"] for i in indices}) == 4096
 train.parent.mkdir(parents=True, exist_ok=True)
 train.write_text("".join(json.dumps(rows[i], ensure_ascii=False) + "\n" for i in indices), encoding="utf-8")
-print(f"Prepared {len(indices)} training examples, excluding {len(held_out)} validation examples")
+print(f"Prepared {len(indices)} training examples from the GSM-MC train split")
 PY
 
 mkdir -p "$checkpoint_root" "$extra_root"
@@ -93,12 +100,12 @@ PY
     extra=()
     if [[ "$mode" == no-loop ]]; then extra+=(--disable-looping); fi
     uv run python -m loop_jev.evaluation.zero_shot \
-      --model "$output" --input "$validation" --output "$root/validation/$experiment-$mode.jsonl" \
+      --model "$output" --input "$test_input" --output "$root/test/$experiment-$mode.jsonl" \
       --backend transformers --data-parallel-size 2 --batch-size 4 "${extra[@]}"
   done
 done
 
-uv run python - "$root/validation" "$prior/validation" "$validation" <<'PY'
+uv run python - "$root/test" "$test_input" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -106,11 +113,11 @@ from pathlib import Path
 from loop_jev.evaluation.latent_kv_summary import score_file
 from loop_jev.training.answer_slot_distill import read_rows
 
-output, prior, validation = map(Path, sys.argv[1:])
-expected_ids = {row["id"] for row in read_rows(validation)}
+output, test_input = map(Path, sys.argv[1:])
+expected_ids = {row["id"] for row in read_rows(test_input)}
 files = {
-    "1024_loop1": prior / "ce1-native.jsonl",
-    "1024_loop3": prior / "ce3-native.jsonl",
+    "1024_loop1": Path("outputs/jev-latent24-ce1-final-ce-kl/eval/gsm-mc-test-loop1.jsonl"),
+    "1024_loop3": Path("outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-loop3.jsonl"),
     "4096_loop1": output / "loop1-native.jsonl",
     "4096_loop3": output / "loop3-native.jsonl",
     "4096_loop3_no_loop": output / "loop3-no-loop.jsonl",

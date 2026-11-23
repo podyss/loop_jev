@@ -4,11 +4,10 @@ cd "$(dirname "$0")/.."
 export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 
-baseline=outputs/jev-loop-cot-comparison
-validation="$baseline/validation.jsonl"
-eval_dir=outputs/jev-workspace-carry/validation
+test_input=data/gsm-mc/test.jsonl
+eval_dir=outputs/jev-workspace-carry/test
 output="${1:-/dev/shm/loop-jev-$(id -u)/workspace-carry}"
-for file in "$validation" "$baseline/validation/ce1-native.jsonl" "$baseline/validation/ce3-native.jsonl"; do
+for file in "$test_input" outputs/jev-latent24-ce1-final-ce-kl/eval/gsm-mc-test-loop1.jsonl outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-loop3.jsonl; do
   [[ -s "$file" ]] || { echo "Missing comparison data: $file" >&2; exit 1; }
 done
 
@@ -39,11 +38,11 @@ PY
 
 for round in 1 3; do
   uv run python -m loop_jev.evaluation.zero_shot \
-    --model "$output" --input "$validation" --output "$eval_dir/round-$round.jsonl" \
+    --model "$output" --input "$test_input" --output "$eval_dir/round-$round.jsonl" \
     --backend transformers --data-parallel-size 2 --batch-size 4 --loop-readout-round "$round"
 done
 
-uv run python - "$eval_dir" "$validation" <<'PY'
+uv run python - "$eval_dir" "$test_input" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -51,11 +50,10 @@ from pathlib import Path
 from loop_jev.evaluation.latent_kv_summary import score_file
 from loop_jev.training.answer_slot_distill import read_rows
 
-out, validation = map(Path, sys.argv[1:])
-prior = validation.parent / "validation"
-expected_ids = {row["id"] for row in read_rows(validation)}
-files = {"ce_kl_1": (prior / "ce1-native.jsonl", None),
-         "ce_kl_3": (prior / "ce3-native.jsonl", None),
+out, test_input = map(Path, sys.argv[1:])
+expected_ids = {row["id"] for row in read_rows(test_input)}
+files = {"ce_kl_1": (Path("outputs/jev-latent24-ce1-final-ce-kl/eval/gsm-mc-test-loop1.jsonl"), None),
+         "ce_kl_3": (Path("outputs/jev-latent24-ce3-final-ce-kl/eval/gsm-mc-test-loop3.jsonl"), None),
          "workspace_round_1": (out / "round-1.jsonl", 1),
          "workspace_round_3": (out / "round-3.jsonl", 3)}
 results = {}
