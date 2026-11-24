@@ -37,5 +37,5 @@ where = ["src"]
 include = ["loop_jev*"]
 
 [[tool.uv.index]]
-url = "https://mirrors.aliyun.com/pypi/simple/"
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
 default = true

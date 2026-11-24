@@ -1,11 +1,13 @@
-"""Distill a ten-round recurrent teacher into one mergeable depth pass."""
+"""Distill a ten-round recurrent teacher into one shared-block pass."""
 
 import argparse
 import json
 import os
 import random
+from copy import deepcopy
 from itertools import chain
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 import torch.distributed as dist
@@ -15,6 +17,7 @@ from transformers import AutoTokenizer
 
 from loop_jev.data.shared_train import digest, shared_rows
 from loop_jev.evaluation.coarse_state import Backbone, pack, reduce_gradients, state_objective
+from loop_jev.evaluation.distributed_eval import eval_rank, eval_world_size
 from loop_jev.evaluation.graph_short_loop import evaluate, prepare_prompts
 from loop_jev.evaluation.time_fold import projections
 from loop_jev.evaluation.zero_shot import read_rows, render_prompt
@@ -78,6 +81,9 @@ class Shortcut:
         self.interval[0] = interval
         return advance(self.base, state, context, interval)
 
+    def parameters(self):
+        return chain.from_iterable((layer.down, layer.up, layer.gain) for layer in self.layers)
+
     def save_weights(self):
         return [[tensor.detach().cpu() for tensor in (layer.down, layer.up, layer.gain)] for layer in self.layers]
 
@@ -86,6 +92,56 @@ class Shortcut:
         for layer, values in zip(self.layers, weights, strict=True):
             for param, value in zip((layer.down, layer.up, layer.gain), values, strict=True):
                 param.copy_(value)
+
+
+class MixedPrecisionLayer(nn.Module):
+    def __init__(self, layer, dtype):
+        super().__init__()
+        self.layer = layer
+        self.dtype = dtype
+
+    def forward(self, *args, **kwargs):
+        # Keep optimizer weights in FP32 and run the entire decoder layer in BF16.
+        weights = {name: param.to(self.dtype) for name, param in self.layer.named_parameters()}
+        return torch.func.functional_call(self.layer, weights, args, kwargs)
+
+
+class FullBlock:
+    def __init__(self, base, *, trainable):
+        self.base = base
+        self.original = base.model.layers[9:18]
+        dtype = next(self.original.parameters()).dtype
+        self.block = deepcopy(self.original).requires_grad_(trainable)
+        if trainable:
+            self.block.float()
+            self.layers = [MixedPrecisionLayer(layer, dtype) for layer in self.block]
+        else:
+            self.layers = self.block
+
+    def replace(self, layers):
+        for index, layer in enumerate(layers, 9):
+            self.base.model.layers[index] = layer
+
+    def restore(self):
+        self.replace(self.original)
+
+    def merged(self, interval):
+        # All three intervals use the same full block and their own damping.
+        return self.layers
+
+    def hop(self, state, context, interval):
+        return advance(self.base, state, context, interval)
+
+    def parameters(self):
+        return self.block.parameters()
+
+    def save_weights(self):
+        original = self.original.state_dict()
+        return {name: value.to(device='cpu', dtype=original[name].dtype)
+                for name, value in self.block.state_dict().items()}
+
+    def load_weights(self, weights):
+        self.block.load_state_dict(weights)
 
 
 def advance(base, state, context, interval):
@@ -150,9 +206,9 @@ def rollout_states(core, before, context):
 
 def train_variant(args, mode, base, vocab, records, device, rank, world):
     torch.manual_seed(43)
-    core = Shortcut(base, args.rank)
+    core = FullBlock(base, trainable=True) if args.full_block else Shortcut(base, args.rank)
     core.replace(core.layers)
-    params = list(chain.from_iterable((layer.down, layer.up, layer.gain) for layer in core.layers))
+    params = list(core.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, fused=True)
     accumulation = 4 // world
     rng = random.Random(43)
@@ -190,13 +246,20 @@ def train_variant(args, mode, base, vocab, records, device, rank, world):
             (loss / accumulation).backward()
             if i % accumulation == 0:
                 if world > 1:
-                    reduce_gradients(params, world)
+                    if args.full_block:
+                        reductions = [dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=True)
+                                      for param in params]
+                        for reduction in reductions:
+                            reduction.wait()
+                    else:
+                        reduce_gradients(params, world)
                 nn.utils.clip_grad_norm_(params, 1.0, error_if_nonfinite=True)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             totals += torch.stack((ce.detach(), kl.detach(), state.detach(), segment.detach(), consistency.detach()))
         if world > 1:
-            totals = totals.cpu()
+            if not args.full_block:
+                totals = totals.cpu()
             dist.all_reduce(totals)
         metrics = dict(zip(('ce', 'kl', 'state', 'segment', 'consistency'),
                            (totals / (world * len(records))).tolist(), strict=True))
@@ -206,10 +269,14 @@ def train_variant(args, mode, base, vocab, records, device, rank, world):
     core.restore()
     if rank == 0:
         args.output.mkdir(parents=True, exist_ok=True)
-        torch.save(dict(mode=mode, teacher=str(Path(args.model).resolve()), weights=core.save_weights(),
-                        rank=args.rank, epochs=args.epochs, examples=args.examples, lr=args.lr,
-                        train_split=args.train_split, train_sha256=digest(args.train.read_bytes()),
-                        parameters=sum(p.numel() for p in params), history=history), args.output / f'{mode}.pt')
+        with TemporaryDirectory(dir=args.output) as temporary:
+            checkpoint = Path(temporary) / f'{mode}.pt'
+            torch.save(dict(mode=mode, teacher=str(Path(args.model).resolve()), weights=core.save_weights(),
+                            full_block=args.full_block, rank=None if args.full_block else args.rank,
+                            epochs=args.epochs, examples=args.examples, lr=args.lr,
+                            train_split=args.train_split, train_sha256=digest(args.train.read_bytes()),
+                            parameters=sum(p.numel() for p in params), history=history), checkpoint)
+            checkpoint.replace(args.output / checkpoint.name)
     return core
 
 
@@ -246,7 +313,7 @@ def capture_rollout(base, core, vocab, records, device):
 
 def train(args, base, vocab, render, pad, device, rank, world):
     pool = read_rows(args.train)
-    if (world not in (1, 2) or args.examples % 16 or not 0 < args.examples <= len(pool)
+    if (world not in (1, 2, 4) or args.examples % 16 or not 0 < args.examples <= len(pool)
             or len({row['id'] for row in pool}) != len(pool)
             or any(row['split'] != 'train' or len(row['options']) != 4
                    or row['gold_index'] not in range(4) for row in pool)):
@@ -260,10 +327,11 @@ def train(args, base, vocab, render, pad, device, rank, world):
         core = train_variant(args, mode, base, vocab, targets, device, rank, world)
         if mode == 'rollout':
             bridge = core
+        del core
 
 
 @torch.inference_mode()
-def benchmark(args, base, render, pad, device):
+def benchmark(args, base, render, pad, device, *, base_ce_result=None):
     prompts = prepare_prompts(read_rows(args.test), render, pad, device)
     train_sha256 = digest(args.train.read_bytes()) if args.train_split == 'fixed' else None
     results = {}
@@ -271,11 +339,13 @@ def benchmark(args, base, render, pad, device):
         if mode in (*MODES, *PROGRESSIVE_MODES):
             saved = torch.load(args.output / f'{mode}.pt', map_location='cpu', weights_only=True)
             if saved['teacher'] != str(Path(args.model).resolve()) or saved['mode'] != mode:
-                raise ValueError(f'Mismatched {mode} adapter')
+                raise ValueError(f'Mismatched {mode} checkpoint')
+            if saved.get('full_block', False) != args.full_block:
+                raise ValueError(f'{mode} checkpoint does not match the --full-block setting')
             if train_sha256 is not None and (saved.get('train_sha256') != train_sha256
                                              or saved.get('train_split') != 'fixed'):
-                raise ValueError(f'{mode} adapter was not trained on the shared training sample')
-            core = Shortcut(base, saved['rank'])
+                raise ValueError(f'{mode} checkpoint was not trained on the shared training sample')
+            core = FullBlock(base, trainable=False) if args.full_block else Shortcut(base, saved['rank'])
             core.load_weights(saved['weights'])
             try:
                 if mode == 'rollout':
@@ -288,18 +358,67 @@ def benchmark(args, base, render, pad, device):
         else:
             result = evaluate(base, prompts, mode, eager=False)
         results[mode] = result
-        print(mode, result, flush=True)
+        if eval_rank() == 0:
+            print(mode, result, flush=True)
         if mode in ('segments', 'shortcut'):
             try:
                 two_hop = evaluate(base, prompts, two_hop_predictor(core), eager=False)
             finally:
                 core.restore()
             results[f'{mode}-two-hop'] = two_hop
-            print(f'{mode}-two-hop', two_hop, flush=True)
+            if eval_rank() == 0:
+                print(f'{mode}-two-hop', two_hop, flush=True)
+        if mode in (*MODES, *PROGRESSIVE_MODES):
+            del saved, core
+    if eval_rank() != 0:
+        return
+    metadata = {}
+    if base_ce_result is not None:
+        results['base-ce'] = base_ce_result
+        metadata['base_ce_model'] = str(args.base_ce_model)
     (args.output / 'test.json').write_text(json.dumps(dict(model=args.model, input=str(args.test), batch_size=1,
         bucket=16, dtype='bfloat16', cuda_graph=True, device=torch.cuda.get_device_name(),
-        train_sha256=train_sha256, results=results),
+        eval_world_size=eval_world_size(),
+        train_sha256=train_sha256, full_block=args.full_block, results=results, **metadata),
         indent=2) + '\n')
+
+
+def load_backbone(path, device, *, looped):
+    model = load_loop_model(path, dtype=torch.bfloat16, device_map={'': device.index},
+                            attn_implementation='sdpa', trust_remote_code=False).eval().requires_grad_(False)
+    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=False)
+    if looped:
+        marker = marker_token_id(tokenizer)
+        validate_checkpoint(model.config, marker)
+        slots = model.config.latent_slots
+    else:
+        if getattr(model.config, 'loop_count', 1) != 1 or getattr(model.config, 'latent_slots', 0):
+            raise ValueError('Expected a single-pass CE checkpoint without latent slots')
+        marker, slots = None, 0
+    encoded = [tokenizer.encode(label, add_special_tokens=False) for label in 'ABCD']
+    if any(len(x) != 1 for x in encoded):
+        raise ValueError('Expected single-token labels')
+    base = Backbone(model, [x[0] for x in encoded])
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    def render(row):
+        return render_prompt(tokenizer, row, slots, marker)
+
+    return base, model.lm_head.weight, render, pad
+
+
+def benchmark_base_ce(args, device):
+    metadata = json.loads((args.base_ce_model / 'experiment.json').read_text(encoding='utf-8'))
+    if metadata.get('status') != 'complete' or metadata.get('teacher') is not None:
+        raise ValueError('Expected a completed CE checkpoint trained without a teacher')
+    if args.train_split == 'fixed' and metadata.get('train_sha256') != digest(args.train.read_bytes()):
+        raise ValueError('CE checkpoint was not trained on the shared training file')
+    base, _, render, pad = load_backbone(args.base_ce_model, device, looped=False)
+    prompts = prepare_prompts(read_rows(args.test), render, pad, device)
+    result = evaluate(base, prompts, 'native', eager=False)
+    if eval_rank() == 0:
+        print('base-ce', result, flush=True)
+    return result
 
 
 def main():
@@ -311,41 +430,34 @@ def main():
     parser.add_argument('--examples', type=int, default=1024)
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--lr', type=float, default=4e-4)
-    parser.add_argument('--rank', type=int, default=16)
+    tuning = parser.add_mutually_exclusive_group()
+    tuning.add_argument('--rank', type=int, default=16)
+    tuning.add_argument('--full-block', action='store_true', help='Fine-tune all nine shared layers.')
     parser.add_argument('--modes', choices=(*MODES, *PROGRESSIVE_MODES), nargs='+', default=MODES)
     parser.add_argument('--train-split', choices=('original', 'disjoint', 'fixed'), default='original')
     parser.add_argument('--evaluate', action='store_true')
+    parser.add_argument('--base-ce-model', type=Path, help='Single-pass CE checkpoint to include in evaluation.')
     args = parser.parse_args()
+    if args.base_ce_model is not None and not args.evaluate:
+        parser.error('--base-ce-model requires --evaluate')
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
-    if (args.rank < 1 or args.epochs < 1 or args.lr <= 0 or (args.evaluate and world != 1)
+    if (args.rank < 1 or args.epochs < 1 or args.lr <= 0
             or len(set(args.modes)) != len(args.modes)
             or (not args.evaluate and 'progressive' in args.modes and
                 ('rollout' not in args.modes or args.modes.index('rollout') > args.modes.index('progressive')))
             or (not args.evaluate and 'shortcut' in args.modes and args.epochs < 2)):
-        parser.error('Invalid training options or multi-device latency benchmark')
+        parser.error('Invalid training options')
     device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
     torch.cuda.set_device(device)
     if world > 1:
-        dist.init_process_group('gloo')
+        dist.init_process_group('nccl' if args.full_block and not args.evaluate else 'gloo')
     try:
-        model = load_loop_model(args.model, dtype=torch.bfloat16, device_map={'': device.index},
-                                attn_implementation='sdpa', trust_remote_code=False).eval().requires_grad_(False)
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
-        marker = marker_token_id(tokenizer)
-        validate_checkpoint(model.config, marker)
-        encoded = [tokenizer.encode(label, add_special_tokens=False) for label in 'ABCD']
-        if any(len(x) != 1 for x in encoded):
-            raise ValueError('Expected single-token labels')
-        base = Backbone(model, [x[0] for x in encoded])
-        pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-        def render(row):
-            return render_prompt(tokenizer, row, model.config.latent_slots, marker)
-
+        base_ce_result = benchmark_base_ce(args, device) if args.base_ce_model is not None else None
+        base, vocab, render, pad = load_backbone(args.model, device, looped=True)
         if args.evaluate:
-            benchmark(args, base, render, pad, device)
+            benchmark(args, base, render, pad, device, base_ce_result=base_ce_result)
         else:
-            train(args, base, model.lm_head.weight, render, pad, device, rank, world)
+            train(args, base, vocab, render, pad, device, rank, world)
     finally:
         if world > 1:
             dist.destroy_process_group()

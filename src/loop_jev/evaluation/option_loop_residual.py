@@ -7,12 +7,14 @@ import random
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers import AutoTokenizer
 
 from loop_jev.data.shared_train import digest, shared_rows
 from loop_jev.evaluation.coarse_state import Backbone
+from loop_jev.evaluation.distributed_eval import eval_rank, eval_shard, eval_world_size, evaluation_device, gather_rows
 from loop_jev.evaluation.graph_short_loop import evaluate, pack_prompts
 from loop_jev.evaluation.option_loop_cascade import MIX, LoopReadout, gather
 from loop_jev.evaluation.option_trie import NumericReadout, make_prompt
@@ -125,9 +127,26 @@ def train_adapter(scores, features, targets, gold, validation, *, distill):
     return head.eval().requires_grad_(False), best_epoch
 
 
+def fit_adapter(scores, features, targets, gold, validation, *, distill):
+    if eval_rank() == 0:
+        torch.manual_seed(131)
+        head, epoch = train_adapter(scores, features, targets, gold, validation, distill=distill)
+    if eval_world_size() == 1:
+        return head, epoch
+    checkpoint = [({k: v.cpu() for k, v in head.state_dict().items()}, epoch) if eval_rank() == 0 else None]
+    dist.broadcast_object_list(checkpoint, src=0)
+    weights, epoch = checkpoint[0]
+    if eval_rank() != 0:
+        head = CandidateCorrection(features.size(-1)).to(scores.device)
+        head.load_state_dict(weights)
+        head.eval().requires_grad_(False)
+    return head, epoch
+
+
 def run_ablation(args, model, base, projection, test, scores, features, gold, validation, mix, train_sha256):
     results = {}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if eval_rank() == 0:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
     for name in ('no-head', *ABLATIONS):
         if name == 'no-head':
             core = NumericReadout(model, joint=True, mix=mix)
@@ -136,17 +155,17 @@ def run_ablation(args, model, base, projection, test, scores, features, gold, va
             groups = ABLATIONS[name]
             mask = None if groups == FEATURE_GROUPS else feature_mask(groups, projection)
             kept = features if mask is None else features.masked_fill(~mask, 0)
-            torch.manual_seed(131)
-            adapter, epoch = train_adapter(scores, kept, None, gold, validation, distill=False)
+            adapter, epoch = fit_adapter(scores, kept, None, gold, validation, distill=False)
             core = CandidateFeatures(model, projection, adapter, mask=mask, mix=mix)
             params = sum(p.numel() for p in adapter.parameters())
         result = evaluate(base, test, 'time-nodes', eager=False, core=core)
         results[name] = {**result, 'features': groups, 'epoch': epoch, 'head_parameters': params}
-        print(name, results[name], flush=True)
-        args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), train=str(args.train),
-            train_size=1024, validation_size=0 if validation is None else 512,
-            mix=mix, train_sha256=train_sha256, seed=131, batch_size=1, bucket=16,
-            device=torch.cuda.get_device_name(), results=results), indent=2) + '\n')
+        if eval_rank() == 0:
+            print(name, results[name], flush=True)
+            args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), train=str(args.train),
+                train_size=1024, validation_size=0 if validation is None else 512,
+                mix=mix, train_sha256=train_sha256, seed=131, batch_size=1, bucket=16,
+                device=torch.cuda.get_device_name(), eval_world_size=eval_world_size(), results=results), indent=2) + '\n')
 
 
 def shared_mix(report, model, train_sha256):
@@ -172,8 +191,14 @@ def main():
     args = p.parse_args()
     if args.shared_train != (args.calibration is not None):
         p.error('--shared-train and --calibration must be used together')
+    with evaluation_device() as device:
+        run(args, device)
+
+
+def run(args, device):
     rows, train = read_rows(args.test), read_rows(args.train)
     validate_test_rows(rows)
+    rows = eval_shard(rows)
     if any(r['split'] != 'train' for r in train) or len({r['id'] for r in train}) != len(train):
         raise ValueError('Expected unique training examples')
     train_sha256 = None
@@ -188,7 +213,7 @@ def main():
         seen = {r['id'] for r in random.Random(42).sample(train, 1024)}
         legacy = {r['id'] for r in random.Random(442).sample([r for r in train if r['id'] not in seen], 512)}
         sample = random.Random(721).sample([r for r in train if r['id'] not in seen | legacy], 1536)
-    model = load_loop_model(args.model, dtype=torch.bfloat16, device_map={'': 0}, attn_implementation='sdpa',
+    model = load_loop_model(args.model, dtype=torch.bfloat16, device_map={'': device.index}, attn_implementation='sdpa',
                             trust_remote_code=False).eval().requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     marker = marker_token_id(tokenizer)
@@ -198,7 +223,6 @@ def main():
         raise ValueError('Expected single-token labels')
     base = Backbone(model, [x[0] for x in labels])
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    device = torch.device('cuda:0')
     generator = torch.Generator().manual_seed(883)
     width = model.config.hidden_size
     projection = (torch.randn(width, 64, generator=generator) / width**.5).to(device, dtype=torch.bfloat16)
@@ -221,26 +245,35 @@ def main():
         for name, core in [('fast-only', NumericReadout(model, joint=True, mix=mix)),
                            (args.checkpoint.stem, CandidateFeatures(model, projection, adapter.eval(), mix=mix))]:
             results[name] = evaluate(base, test, 'time-nodes', eager=False, core=core)
-            print(name, results[name], flush=True)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), batch_size=1, bucket=16,
-            device=torch.cuda.get_device_name(), mix=mix, train_sha256=train_sha256, results=results), indent=2) + '\n')
+            if eval_rank() == 0:
+                print(name, results[name], flush=True)
+        if eval_rank() == 0:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), batch_size=1, bucket=16,
+                device=torch.cuda.get_device_name(), eval_world_size=eval_world_size(), mix=mix,
+                train_sha256=train_sha256, results=results), indent=2) + '\n')
         return
 
     with torch.no_grad():
         features, scores = [], []
-        for row in sample:
+        for row in eval_shard(sample):
             ids, meta, _ = packed(row)
             current, encoded = reader.features(base, ids, meta)
             scores.append(current)
             features.append(encoded)
-        scores, features = torch.stack(scores), torch.stack(features)
-        print('Collected frozen single-pass candidate features', flush=True)
+        scores = gather_rows(torch.stack(scores), len(sample))
+        features = gather_rows(torch.stack(features), len(sample))
+        if eval_rank() == 0:
+            print('Collected frozen single-pass candidate features', flush=True)
+        delta = None
         if not args.ablate:
-            slow = pack_prompts(sample[:1024], lambda r: render_prompt(tokenizer, r, model.config.latent_slots, marker),
-                                pad, device)
+            slow_rows = sample[:1024]
+            slow = pack_prompts(eval_shard(slow_rows),
+                                lambda r: render_prompt(tokenizer, r, model.config.latent_slots, marker), pad, device)
             delta = center(gather(base, LoopReadout(True), slow) - gather(base, LoopReadout(False), slow))
-            print('Collected real ten-round logit residual targets', flush=True)
+            delta = gather_rows(delta, len(slow_rows))
+            if eval_rank() == 0:
+                print('Collected real ten-round logit residual targets', flush=True)
     gold = torch.tensor([r['gold_index'] for r in sample], device=device)
     test = [packed(row) for row in rows]
     if args.ablate:
@@ -249,21 +282,22 @@ def main():
     adapters = {}
     epochs = {}
     for name, use_delta in [('answer-only', False), ('loop-residual', True)]:
-        torch.manual_seed(131)
-        adapters[name], epochs[name] = train_adapter(scores, features, delta, gold, validation, distill=use_delta)
+        adapters[name], epochs[name] = fit_adapter(scores, features, delta, gold, validation, distill=use_delta)
     results = {}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if eval_rank() == 0:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
     for name, adapter in adapters.items():
         result = evaluate(base, test, 'time-nodes', eager=False,
                           core=CandidateFeatures(model, projection, adapter, mix=mix))
         results[name] = {**result, 'epoch': epochs[name]}
-        torch.save(dict(model=args.model, projection=projection.cpu(), adapter=adapter.state_dict(),
-                        mix=mix, train_sha256=train_sha256),
-                   args.output.with_name(f'{args.output.stem}-{name}.pt'))
-        print(name, results[name], flush=True)
-        args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test),
-            batch_size=1, bucket=16, device=torch.cuda.get_device_name(), mix=mix, train_sha256=train_sha256,
-            results=results), indent=2) + '\n')
+        if eval_rank() == 0:
+            torch.save(dict(model=args.model, projection=projection.cpu(), adapter=adapter.cpu().state_dict(),
+                            mix=mix, train_sha256=train_sha256),
+                       args.output.with_name(f'{args.output.stem}-{name}.pt'))
+            print(name, results[name], flush=True)
+            args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test),
+                batch_size=1, bucket=16, device=torch.cuda.get_device_name(), eval_world_size=eval_world_size(),
+                mix=mix, train_sha256=train_sha256, results=results), indent=2) + '\n')
 
 
 if __name__ == '__main__':

@@ -2,15 +2,18 @@
 
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from loop_jev.data.shared_train import digest, shared_rows
 from loop_jev.evaluation.coarse_state import Backbone
+from loop_jev.evaluation.distributed_eval import eval_rank, eval_shard, eval_world_size, evaluation_device
 from loop_jev.evaluation.graph_short_loop import evaluate
 from loop_jev.evaluation.short_loop import validate_test_rows
 from loop_jev.evaluation.zero_shot import read_rows, render_prompt
@@ -50,19 +53,44 @@ def trie_mask(positions, branches):
 
 
 class NumericReadout:
-    def __init__(self, model, *, local=False, average=False, joint=False, mix=0.0):
+    def __init__(self, model, *, local=False, average=False, joint=False, mix=0.0, execute_loops=False):
         self.head = model.lm_head.weight
         self.local = local
         self.average = average
         self.joint = joint
         self.mix = mix
+        self.execute_loops = execute_loops
 
     def encode(self, base, packed):
         token_ids, positions, branches = packed.split(1, dim=0)
         embedding = base.model.embed_tokens(token_ids)
         mask = trie_mask(positions, branches)
         rope = base.model.rotary_emb(embedding, positions)
-        return base.stack(embedding, (positions, rope, mask), 0, len(base.model.layers))
+        context = positions, rope, mask
+        if not self.execute_loops:
+            return base.stack(embedding, context, 0, len(base.model.layers))
+
+        config = base.model.config
+        start = config.loop_start_layer
+        end = config.loop_end_layer
+        rounds = config.loop_count
+        if (getattr(config, 'loop_schedule', 'block') != 'block' or rounds < 2
+                or not getattr(config, 'loop_damping', False)
+                or getattr(config, 'loop_transition_rank', 0)
+                or getattr(config, 'loop_carry_workspace', False)
+                or getattr(config, 'loop_evidence_reread', False)
+                or getattr(config, 'loop_staged_handoff', False)
+                or getattr(config, 'loop_multiscale_workspace', None)):
+            raise ValueError('Trie loop execution requires a plain damped block-loop checkpoint')
+        if not 0 <= start < end <= len(base.model.layers):
+            raise ValueError('Invalid loop block in model config')
+
+        state = base.stack(embedding, context, 0, start)
+        step = config.loop_damping_step or 1 / rounds
+        for _ in range(rounds):
+            block_output = base.stack(state, context, start, end)
+            state = state + step * (block_output - state)
+        return base.stack(state, context, end, len(base.model.layers))
 
     def scores(self, base, packed, meta):
         return self.read(base, packed, meta, self.encode(base, packed))
@@ -167,6 +195,11 @@ def calibrate(core, base, prompts):
     gold = torch.tensor(gold, device=numeric.device)
     candidates = (0., .25, .5, .75, 1., 1.5, 2., 3.)
     counts = [(combine(numeric, labels, w).argmax(-1) == gold).sum().item() for w in candidates]
+    if eval_world_size() > 1:
+        with torch.inference_mode(False):
+            totals = torch.tensor(counts)
+            dist.all_reduce(totals)
+            counts = totals.tolist()
     return max(zip(candidates, counts, strict=True), key=lambda pair: pair[1])[0]
 
 
@@ -181,8 +214,18 @@ def main():
                    default=('local', 'full', 'average'))
     p.add_argument('--adapter', type=Path, help='Optional merged time-fold checkpoint')
     p.add_argument('--shared-train', action='store_true', help='Calibrate on the exact 1024 training rows')
+    p.add_argument('--mix', type=float, help='Fixed label-score weight for dual readout (default: auto-calibrate)')
+    p.add_argument('--execute-loops', action='store_true',
+                   help='Execute all configured damped block-loop rounds before the dual readout')
     args = p.parse_args()
-    model = load_loop_model(args.model, dtype=torch.bfloat16, device_map={'': 0},
+    if args.mix is not None and (not math.isfinite(args.mix) or args.mix < 0):
+        p.error('--mix must be a finite nonnegative number')
+    with evaluation_device() as device:
+        run(args, device)
+
+
+def run(args, device):
+    model = load_loop_model(args.model, dtype=torch.bfloat16, device_map={'': device.index},
                             attn_implementation='sdpa', trust_remote_code=False).eval().requires_grad_(False)
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     base = Backbone(model, [tokenizer.encode(x, add_special_tokens=False)[0] for x in 'ABCD'])
@@ -196,16 +239,18 @@ def main():
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     rows = read_rows(args.test)
     validate_test_rows(rows)
+    rows = eval_shard(rows)
     results = {}
     for mode in args.modes:
         core = NumericReadout(model, local=mode == 'local', average=mode == 'average',
-                              joint=mode not in ('full', 'average', 'local'))
+                              joint=mode not in ('full', 'average', 'local'),
+                              execute_loops=args.execute_loops)
 
         def packed(row):
-            return make_prompt(tokenizer, row, pad, torch.device('cuda:0'), config=model.config if core.joint else None,
+            return make_prompt(tokenizer, row, pad, device, config=model.config if core.joint else None,
                                layout=mode)
 
-        if core.joint:
+        if core.joint and args.mix is None:
             train = read_rows(args.train)
             if args.shared_train:
                 calibration = shared_rows(train)
@@ -215,17 +260,26 @@ def main():
                     raise ValueError('Expected a unique training pool with disjoint calibration questions')
                 seen = {r['id'] for r in random.Random(42).sample(train, 1024)}
                 calibration = random.Random(442).sample([r for r in train if r['id'] not in seen], 512)
-            core.mix = calibrate(core, base, [packed(row) for row in calibration])
-            print('Calibration mix:', core.mix, flush=True)
+            core.mix = calibrate(core, base, [packed(row) for row in eval_shard(calibration)])
+            if eval_rank() == 0:
+                print('Calibration mix:', core.mix, flush=True)
+        elif core.joint:
+            core.mix = args.mix
+            if eval_rank() == 0:
+                print('Manual mix:', core.mix, flush=True)
         current = [packed(row) for row in rows]
         results[mode] = evaluate(base, current, 'time-nodes', eager=False, core=core)
+        if args.execute_loops:
+            results[mode]['loop_rounds'] = model.config.loop_count
         if core.joint:
             results[mode]['mix'] = core.mix
-        print(mode, results[mode], flush=True)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), device=torch.cuda.get_device_name(),
-            batch_size=1, bucket=16, results=results, adapter=str(args.adapter) if args.adapter else None,
-            train_sha256=digest(args.train.read_bytes()) if args.shared_train else None), indent=2) + '\n')
+        if eval_rank() == 0:
+            print(mode, results[mode], flush=True)
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), device=torch.cuda.get_device_name(),
+                eval_world_size=eval_world_size(), batch_size=1, bucket=16, results=results,
+                adapter=str(args.adapter) if args.adapter else None,
+                train_sha256=digest(args.train.read_bytes()) if args.shared_train else None), indent=2) + '\n')
 
 
 if __name__ == '__main__':

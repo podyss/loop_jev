@@ -8,9 +8,11 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from transformers import AutoTokenizer
 
 from loop_jev.evaluation.coarse_state import Backbone, CoarseCorrection, collocate
+from loop_jev.evaluation.distributed_eval import eval_shard, eval_world_size
 from loop_jev.evaluation.short_loop import validate_test_rows
 from loop_jev.evaluation.zero_shot import read_rows, render_prompt
 from loop_jev.looping import damped_update
@@ -131,7 +133,7 @@ def predict(base, ids, lengths, mode, core=None):
 
 def prepare_prompts(rows, render, pad, device, bucket=16):
     validate_test_rows(rows)
-    return pack_prompts(rows, render, pad, device, bucket)
+    return pack_prompts(eval_shard(rows), render, pad, device, bucket)
 
 
 def pack_prompts(rows, render, pad, device, bucket=16):
@@ -184,13 +186,29 @@ def evaluate(base, prompts, mode, *, eager, core=None):
 
     for ids, length, _ in prompts[:20]:
         run(ids, length)
+    world = eval_world_size()
+    if world > 1:
+        dist.barrier()
+    begin = time.perf_counter()
     correct, samples = 0, []
     for ids, length, label in prompts:
         start = time.perf_counter()
         chosen = run(ids, length)
         samples.append((time.perf_counter() - start) * 1000)
         correct += chosen == label
-    return dict(correct=correct, total=len(samples), accuracy=correct / len(samples), graphs=len(graphs),
+    seconds = time.perf_counter() - begin
+    graph_count = len(graphs)
+    if world > 1:
+        with torch.inference_mode(False):
+            gathered = [None] * world
+            dist.all_gather_object(gathered, (correct, samples, graph_count, capture_seconds, seconds))
+        correct = sum(result[0] for result in gathered)
+        samples = [sample for result in gathered for sample in result[1]]
+        graph_count = sum(result[2] for result in gathered)
+        capture_seconds = max(result[3] for result in gathered)
+        seconds = max(result[4] for result in gathered)
+    return dict(correct=correct, total=len(samples), accuracy=correct / len(samples), graphs=graph_count,
+                evaluation_seconds=seconds, examples_per_second=len(samples) / seconds,
                 capture_seconds=capture_seconds, wall_ms_p50=statistics.median(samples),
                 wall_ms_p95=sorted(samples)[math.ceil(.95 * len(samples)) - 1])
 
