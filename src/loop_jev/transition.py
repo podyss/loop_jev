@@ -7,6 +7,7 @@ from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM, Qwen3ForCausalLM
 from transformers import initialization as init
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_utils import slice_logits_to_keep
 from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 from loop_jev.up_loop import UpLoopQwen3DecoderLayer
@@ -18,8 +19,27 @@ class OptionWorkspaceOutput(CausalLMOutputWithPast):
     answer_token_logits: torch.Tensor | None = None
 
 
+@dataclass
+class DualReadoutOutput(CausalLMOutputWithPast):
+    mix: torch.Tensor | None = None
+
+
 class ZeroInitLinear(nn.Linear):
     """Marker for HF initialization of the residual output projection."""
+
+
+class DualReadoutMixHead(nn.Module):
+    def __init__(self, hidden_size, initial_mix):
+        super().__init__()
+        self.initial_mix = initial_mix
+        self.input_projection = nn.Linear(2 * hidden_size, 64)
+        self.output_projection = ZeroInitLinear(64, 1, bias=False)
+        nn.init.zeros_(self.output_projection.weight)
+
+    def forward(self, readout_states):
+        features = torch.nn.functional.gelu(self.input_projection(readout_states.flatten(-2)))
+        log_multiplier = self.output_projection(features).float()
+        return self.initial_mix * (2 * log_multiplier.tanh()).exp()
 
 
 class LoopTransition(nn.Module):
@@ -55,6 +75,23 @@ class LinearLoopCorrection(nn.Module):
         return self.projection(hidden_states[:, -1:, :])
 
 
+class DirectAnswerHead(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        width = 64
+        self.query = nn.Linear(hidden_size, width, bias=False)
+        self.key = nn.Linear(hidden_size, width, bias=False)
+        self.scale = width ** -0.5
+
+    def forward(self, hidden, option_positions):
+        indices = option_positions.clamp_min(0).unsqueeze(-1).expand(-1, -1, hidden.size(-1))
+        options = hidden.gather(1, indices)
+        query = self.query(hidden[:, -1]).float()
+        keys = self.key(options).float()
+        scores = (query[:, None] * keys).sum(dim=-1) * self.scale
+        return scores.masked_fill(option_positions < 0, float("-inf"))
+
+
 class Qwen3LoopForCausalLM(Qwen3ForCausalLM):
     _no_split_modules = [*Qwen3ForCausalLM._no_split_modules, "UpLoopQwen3DecoderLayer"]
 
@@ -82,13 +119,43 @@ class Qwen3LoopForCausalLM(Qwen3ForCausalLM):
         if core_width:
             from loop_jev.latent_core import LatentCore
             self.latent_core = LatentCore(config.hidden_size, core_width, ZeroInitLinear)
+        direct_answer_head = getattr(config, "direct_answer_head", False)
+        if direct_answer_head == "shared":
+            self.direct_answer_head = DirectAnswerHead(config.hidden_size)
+        elif direct_answer_head:
+            self.direct_answer_head = nn.Linear(config.hidden_size, 4)
+        mix_initial = getattr(config, "dual_readout_mix_head_initial", None)
+        if mix_initial is not None:
+            self.dual_readout_mix_head = DualReadoutMixHead(config.hidden_size, mix_initial)
         if (getattr(config, "loop_schedule", "block") == "layerwise-gated"
                 or getattr(config, "loop_transition_rank", 0) > 0 or option_workspace or refinement_ids
-                or core_width):
+                or core_width or direct_answer_head or mix_initial is not None):
             # Register before from_pretrained applies FSDP or loads checkpoint tensors.
             self.post_init()
 
-    def forward(self, *args, option_spans=None, option_vocab_logits=False, refine_answer_scores=False, **kwargs):
+    def forward(self, *args, option_spans=None, option_vocab_logits=False, refine_answer_scores=False,
+                direct_answer_scores=False, direct_answer_positions=None, mix_head_positions=None, **kwargs):
+        if mix_head_positions is not None:
+            logits_to_keep = kwargs.pop("logits_to_keep", 0)
+            hidden = self.model(*args, **kwargs).last_hidden_state
+            mix_states = slice_logits_to_keep(hidden, mix_head_positions)
+            logits = self.lm_head(slice_logits_to_keep(hidden, logits_to_keep))
+            return DualReadoutOutput(logits=logits, mix=self.dual_readout_mix_head(mix_states))
+        if direct_answer_scores:
+            kwargs.pop("logits_to_keep", None)
+            outputs = self.model(*args, **kwargs)
+            hidden = outputs.last_hidden_state
+            state = hidden[:, -1:, :]
+            if self.config.direct_answer_head == "shared":
+                if direct_answer_positions is None:
+                    raise ValueError("The shared answer head requires the option end positions")
+                scores = self.direct_answer_head(hidden, direct_answer_positions)
+            else:
+                scores = self.direct_answer_head(state[:, 0, :])
+            return OptionWorkspaceOutput(
+                logits=scores,
+                answer_token_logits=self.lm_head(state) if option_vocab_logits else None,
+            )
         if refine_answer_scores:
             if not hasattr(self, "loop_answer_refinement") or not hasattr(self.model, "_unlooped_forward"):
                 raise ValueError("Answer refinement needs an enabled refinement checkpoint")
@@ -132,7 +199,9 @@ def load_loop_model(path, *, config=None, **kwargs):
     gated = getattr(config, "loop_schedule", "block") == "layerwise-gated"
     model_class = AutoModelForCausalLM
     if (getattr(config, "loop_transition_rank", 0) > 0 or gated or getattr(config, "option_workspace", False)
-            or getattr(config, "loop_refinement_token_ids", None) or getattr(config, "latent_core_width", 0)):
+            or getattr(config, "loop_refinement_token_ids", None) or getattr(config, "latent_core_width", 0)
+            or getattr(config, "direct_answer_head", False)
+            or getattr(config, "dual_readout_mix_head_initial", None) is not None):
         if config.model_type != "qwen3":
             raise ValueError("Loop extensions currently support Qwen3 only")
         model_class = Qwen3LoopForCausalLM

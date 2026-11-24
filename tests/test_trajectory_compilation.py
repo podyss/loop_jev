@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from loop_jev.evaluation.option_loop_cascade import fast_scores, fit_router, route_score
 from loop_jev.evaluation.option_loop_residual import ABLATIONS, CandidateCorrection, ending_parents, feature_mask
-from loop_jev.evaluation.option_trie import join_canonical, make_trie, trie_mask
+from loop_jev.evaluation.option_trie import join_canonical, make_trie, mix_head_positions, trie_edges, trie_mask
 from loop_jev.evaluation.phase_slots import coarsen, consensus_logits, rotate_options, workspace_positions
 from loop_jev.evaluation.tail_replay import RecordKV, ReplayKV, tail_positions
 from loop_jev.evaluation.two_step_surrogate import TwoStepSurrogate, complete_pair
@@ -67,6 +67,26 @@ class TrajectoryCompilationTests(unittest.TestCase):
             torch.testing.assert_close(joint[:, :, indices], out)
         self.assertEqual(ids[label], canonical[-1])
         self.assertEqual(parents[0], len(prefix) - 1)
+
+    def test_trie_keeps_letter_branch_separate_with_variable_option_counts(self):
+        prefix = [10, 11, 12]
+        canonical = [10, 11, 20, 21, 22]
+        for option_count in (1, 5, 26):
+            with self.subTest(option_count=option_count):
+                options = [[5, 100 + index] for index in range(option_count)]
+                ids, positions, branches, parents, count, prefix_len = make_trie(prefix, options, 0)
+                ids, positions, branches, label = join_canonical(
+                    ids, positions, branches, prefix_len, count, canonical, 0,
+                )
+                meta = torch.tensor([[count, prefix_len, label, *parents, 0]])
+                tokens, _, active = trie_edges(torch.tensor([ids]), torch.tensor([branches]), meta, 26)
+                for index, option in enumerate(options):
+                    self.assertEqual(tokens[0, active[0, :, index]].tolist(), option)
+                self.assertFalse(active[..., option_count:].any())
+                mask = trie_mask(torch.tensor([positions]), torch.tensor([branches]))
+                numeric_last, letter_last = mix_head_positions(meta)[0].tolist()
+                self.assertEqual([ids[numeric_last], ids[letter_last]], [prefix[-1], canonical[-1]])
+                self.assertEqual(torch.tensor(ids)[mask[0, 0, letter_last]].tolist(), canonical)
 
     def test_option_alignment_and_workspace(self):
         row = {'options': ['1', '2', '3', '4'], 'gold_index': 3}

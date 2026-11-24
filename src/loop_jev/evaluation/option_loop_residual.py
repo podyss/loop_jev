@@ -17,7 +17,7 @@ from loop_jev.evaluation.coarse_state import Backbone
 from loop_jev.evaluation.distributed_eval import eval_rank, eval_shard, eval_world_size, evaluation_device, gather_rows
 from loop_jev.evaluation.graph_short_loop import evaluate, pack_prompts
 from loop_jev.evaluation.option_loop_cascade import MIX, LoopReadout, gather
-from loop_jev.evaluation.option_trie import NumericReadout, make_prompt
+from loop_jev.evaluation.option_trie import NumericReadout, compact_label_prompt, make_prompt
 from loop_jev.evaluation.short_loop import validate_test_rows
 from loop_jev.evaluation.zero_shot import read_rows, render_prompt
 from loop_jev.training.latent_kv import marker_token_id
@@ -93,6 +93,27 @@ class CandidateCorrection(nn.Module):
 
     def forward(self, scores, features):
         return scores + self.correction(features)
+
+
+class LabelOnlyReadout:
+    def __init__(self, projection, adapter=None, *, mix):
+        self.projection = projection
+        self.adapter = adapter
+        self.mix = mix
+
+    def predict(self, base, ids, lengths):
+        _, first, context = base.inputs(ids)
+        answer = base.answer_state(first, context, lengths)
+        labels = F.linear(answer, base.readout).float().squeeze(0)
+        if self.adapter is None:
+            return labels.argmax()
+
+        projected = (answer @ self.projection).float().expand(4, -1)
+        missing = labels.new_zeros(4)
+        scores = torch.stack((missing, center(labels), missing), dim=-1)
+        # The saved head expects numeric-branch features in its first two groups.
+        features = torch.cat((labels.new_zeros(4, 2 * projected.size(-1)), projected, scores), dim=-1)
+        return self.adapter(self.mix * labels, features).argmax()
 
 
 def train_adapter(scores, features, targets, gold, validation, *, distill):
@@ -188,9 +209,12 @@ def main():
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--checkpoint', type=Path, help='Evaluate a saved candidate head without retraining')
     mode.add_argument('--ablate', action='store_true', help='Retrain answer-only heads with selected feature groups masked')
+    p.add_argument('--label-only', action='store_true', help='Evaluate a saved head with only the letter readout')
     args = p.parse_args()
     if args.shared_train != (args.calibration is not None):
         p.error('--shared-train and --calibration must be used together')
+    if args.label_only and not args.checkpoint:
+        p.error('--label-only requires --checkpoint')
     with evaluation_device() as device:
         run(args, device)
 
@@ -240,10 +264,17 @@ def run(args, device):
         projection = saved['projection']
         adapter = CandidateCorrection(3 * projection.size(-1) + 3).to(device)
         adapter.load_state_dict(saved['adapter'])
-        test = [packed(row) for row in rows]
+        if args.label_only:
+            test = pack_prompts(rows, lambda row: compact_label_prompt(tokenizer, row, model.config, no_slots=True),
+                                pad, device)
+            cores = [('label-only', LabelOnlyReadout(projection, mix=mix)),
+                     (args.checkpoint.stem, LabelOnlyReadout(projection, adapter.eval(), mix=mix))]
+        else:
+            test = [packed(row) for row in rows]
+            cores = [('fast-only', NumericReadout(model, joint=True, mix=mix)),
+                     (args.checkpoint.stem, CandidateFeatures(model, projection, adapter.eval(), mix=mix))]
         results = {}
-        for name, core in [('fast-only', NumericReadout(model, joint=True, mix=mix)),
-                           (args.checkpoint.stem, CandidateFeatures(model, projection, adapter.eval(), mix=mix))]:
+        for name, core in cores:
             results[name] = evaluate(base, test, 'time-nodes', eager=False, core=core)
             if eval_rank() == 0:
                 print(name, results[name], flush=True)
@@ -251,7 +282,7 @@ def run(args, device):
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(dict(model=args.model, input=str(args.test), batch_size=1, bucket=16,
                 device=torch.cuda.get_device_name(), eval_world_size=eval_world_size(), mix=mix,
-                train_sha256=train_sha256, results=results), indent=2) + '\n')
+                train_sha256=train_sha256, label_only=args.label_only, results=results), indent=2) + '\n')
         return
 
     with torch.no_grad():

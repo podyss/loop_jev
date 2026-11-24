@@ -11,9 +11,16 @@ SLOT_COUNT = OPTION_COUNT * SLOTS_PER_OPTION
 def encode_option_prompt(tokenizer, row):
     if len(row["options"]) != OPTION_COUNT:
         raise ValueError("Option workspace requires exactly four choices")
+    return encode_choice_prompt(tokenizer, row)
+
+
+def encode_choice_prompt(tokenizer, row):
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if not 1 <= len(row["options"]) <= len(labels):
+        raise ValueError("Expected 1 to 26 answer options")
     content = f"Question: {row['question']}\nOptions:\n"
     spans = []
-    for label, option in zip("ABCD", row["options"]):
+    for label, option in zip(labels, row["options"]):
         content += f"({label}) "
         start = len(content)
         content += str(option).strip()
@@ -38,6 +45,14 @@ def encode_option_prompt(tokenizer, row):
 
 def pad_option_spans(spans, offsets):
     return torch.tensor(spans, dtype=torch.long) + torch.tensor(offsets, dtype=torch.long)[:, None, None]
+
+
+def pad_option_end_positions(spans, offsets):
+    width = max(map(len, spans))
+    return torch.tensor([
+        [end - 1 + offset for _, end in choices] + [-1] * (width - len(choices))
+        for choices, offset in zip(spans, offsets, strict=True)
+    ], dtype=torch.long)
 
 
 def seed_option_slots(hidden, spans, offsets, suffix):

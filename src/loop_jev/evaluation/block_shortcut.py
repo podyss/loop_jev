@@ -31,6 +31,8 @@ DIRECT, FIRST, SECOND = range(3)
 INTERVALS = ((0, 10), (0, 5), (5, 10))
 MODES = ('ce', 'endpoint', 'segments', 'shortcut')
 PROGRESSIVE_MODES = ('rollout', 'progressive')
+SUPPORTED_MODES = (*MODES, *PROGRESSIVE_MODES, 'consistency')
+EMA_DECAY = 0.99
 
 
 class IntervalLinear(nn.Module):
@@ -146,8 +148,14 @@ class FullBlock:
 
 def advance(base, state, context, interval):
     start, end = INTERVALS[interval]
+    return advance_rounds(base, state, context, end - start)
+
+
+def advance_rounds(base, state, context, remaining):
+    if remaining == 0:
+        return state
     raw = base.stack(state, context, 9, 18)
-    return damped_update(state, raw, 10, 1 - 0.9**(end - start))
+    return damped_update(state, raw, 10, 1 - 0.9**remaining)
 
 
 def predict_direct(base, ids, lengths):
@@ -170,28 +178,37 @@ def two_hop_predictor(core):
     return predict
 
 
-def teacher_states(base, before, context):
+def teacher_states(base, before, context, *, rounds=(5, 10)):
     state = before
-    for i in range(10):
+    states = [before] if 0 in rounds else []
+    for step in range(1, 11):
         state = damped_update(state, base.stack(state, context, 9, 18), 10, 0.1)
-        if i == 4:
-            middle = state
-    return middle, state
+        if step in rounds:
+            states.append(state)
+    return tuple(states)
 
 
 @torch.no_grad()
-def capture(base, vocab, examples, pad, device):
-    records = []
+def capture(base, vocab, examples, pad, device, *, capture_trajectory=False):
+    records, trajectories = [], []
+    rounds = tuple(range(11)) if capture_trajectory else (5, 10)
     for i in range(0, len(examples), 4):
         prompts, gold = zip(*examples[i:i + 4], strict=True)
         ids, lengths, valid = pack(prompts, pad, device)
         before, context = base.prefix(ids, valid)
-        middle, end = teacher_states(base, before, context)
-        logits = F.linear(base.answer_state(end, context, lengths), vocab)
-        records.append(tuple(x.cpu() for x in (before, middle, end, logits, lengths, valid)) + (torch.tensor(gold),))
+        states = teacher_states(base, before, context, rounds=rounds)
+        logits = F.linear(base.answer_state(states[-1], context, lengths), vocab)
+        cached = tuple(state.cpu() for state in states)
+        if capture_trajectory:
+            trajectories.append(cached)
+            before, middle, end = cached[0], cached[5], cached[10]
+        else:
+            before = before.cpu()
+            middle, end = cached
+        records.append((before, middle, end, logits.cpu(), lengths.cpu(), valid.cpu(), torch.tensor(gold)))
         if (i // 4 + 1) % 32 == 0:
             print(f'{device}: captured {i // 4 + 1}/{len(examples) // 4} teacher batches', flush=True)
-    return records
+    return records, trajectories
 
 
 def kl_objective(student, teacher):
@@ -204,9 +221,14 @@ def rollout_states(core, before, context):
     return middle, core.hop(middle, context, SECOND)
 
 
-def train_variant(args, mode, base, vocab, records, device, rank, world):
+def train_variant(args, mode, base, vocab, records, device, rank, world, *, trajectories=None):
     torch.manual_seed(43)
     core = FullBlock(base, trainable=True) if args.full_block else Shortcut(base, args.rank)
+    ema = None
+    if mode == 'consistency':
+        ema = FullBlock(base, trainable=True)
+        ema.block.requires_grad_(False)
+        ema_params = list(ema.parameters())
     core.replace(core.layers)
     params = list(core.parameters())
     optimizer = torch.optim.AdamW(params, lr=args.lr, fused=True)
@@ -221,6 +243,14 @@ def train_variant(args, mode, base, vocab, records, device, rank, world):
             before, middle, end, teacher, lengths, valid, gold = (x.to(device) for x in records[index])
             context = base.context(before, valid)
             with torch.autocast('cuda', dtype=torch.bfloat16, cache_enabled=False):
+                if ema is not None:
+                    step = ((epoch * len(records) + i - 1) * world + rank) % 10
+                    trajectory = trajectories[index]
+                    next_state = end if step == 9 else trajectory[step + 1].to(device)
+                    ema.replace(ema.layers)
+                    with torch.no_grad():
+                        target = advance_rounds(base, next_state, context, 9 - step)
+                    core.replace(core.layers)
                 if mode == 'rollout':
                     first, final = rollout_states(core, before, context)
                 else:
@@ -242,6 +272,10 @@ def train_variant(args, mode, base, vocab, records, device, rank, world):
                         with torch.no_grad():
                             composed = core.hop(first.detach(), context, SECOND)
                         consistency = state_objective(final, composed, before, valid)
+                if ema is not None:
+                    current = before if step == 0 else trajectory[step].to(device)
+                    prediction = final if step == 0 else advance_rounds(base, current, context, 10 - step)
+                    consistency = state_objective(prediction, target, before, valid)
             loss = ce + kl + 0.5 * state + 0.5 * segment + 0.5 * consistency
             (loss / accumulation).backward()
             if i % accumulation == 0:
@@ -255,6 +289,9 @@ def train_variant(args, mode, base, vocab, records, device, rank, world):
                         reduce_gradients(params, world)
                 nn.utils.clip_grad_norm_(params, 1.0, error_if_nonfinite=True)
                 optimizer.step()
+                if ema is not None:
+                    with torch.no_grad():
+                        torch._foreach_lerp_(ema_params, params, 1 - EMA_DECAY)
                 optimizer.zero_grad(set_to_none=True)
             totals += torch.stack((ce.detach(), kl.detach(), state.detach(), segment.detach(), consistency.detach()))
         if world > 1:
@@ -271,11 +308,13 @@ def train_variant(args, mode, base, vocab, records, device, rank, world):
         args.output.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(dir=args.output) as temporary:
             checkpoint = Path(temporary) / f'{mode}.pt'
-            torch.save(dict(mode=mode, teacher=str(Path(args.model).resolve()), weights=core.save_weights(),
+            trained = core if ema is None else ema
+            metadata = {} if ema is None else dict(ema_decay=EMA_DECAY)
+            torch.save(dict(mode=mode, teacher=str(Path(args.model).resolve()), weights=trained.save_weights(),
                             full_block=args.full_block, rank=None if args.full_block else args.rank,
                             epochs=args.epochs, examples=args.examples, lr=args.lr,
                             train_split=args.train_split, train_sha256=digest(args.train.read_bytes()),
-                            parameters=sum(p.numel() for p in params), history=history), checkpoint)
+                            parameters=sum(p.numel() for p in params), history=history, **metadata), checkpoint)
             checkpoint.replace(args.output / checkpoint.name)
     return core
 
@@ -320,11 +359,12 @@ def train(args, base, vocab, render, pad, device, rank, world):
         raise ValueError('Expected unique GSM-MC training rows and a complete effective batch of 16')
     chosen = choose_train_rows(pool, args.examples, args.train_split)
     examples = sorted(((render(row), row['gold_index']) for row in chosen), key=lambda item: len(item[0]))
-    records = capture(base, vocab, examples[rank::world], pad, device)
+    records, trajectories = capture(base, vocab, examples[rank::world], pad, device,
+                                    capture_trajectory='consistency' in args.modes)
     bridge = None
     for mode in args.modes:
         targets = records if mode != 'progressive' else capture_rollout(base, bridge, vocab, records, device)
-        core = train_variant(args, mode, base, vocab, targets, device, rank, world)
+        core = train_variant(args, mode, base, vocab, targets, device, rank, world, trajectories=trajectories)
         if mode == 'rollout':
             bridge = core
         del core
@@ -336,7 +376,7 @@ def benchmark(args, base, render, pad, device, *, base_ce_result=None):
     train_sha256 = digest(args.train.read_bytes()) if args.train_split == 'fixed' else None
     results = {}
     for mode in ('native', 'teacher', *args.modes):
-        if mode in (*MODES, *PROGRESSIVE_MODES):
+        if mode in SUPPORTED_MODES:
             saved = torch.load(args.output / f'{mode}.pt', map_location='cpu', weights_only=True)
             if saved['teacher'] != str(Path(args.model).resolve()) or saved['mode'] != mode:
                 raise ValueError(f'Mismatched {mode} checkpoint')
@@ -368,7 +408,7 @@ def benchmark(args, base, render, pad, device, *, base_ce_result=None):
             results[f'{mode}-two-hop'] = two_hop
             if eval_rank() == 0:
                 print(f'{mode}-two-hop', two_hop, flush=True)
-        if mode in (*MODES, *PROGRESSIVE_MODES):
+        if mode in SUPPORTED_MODES:
             del saved, core
     if eval_rank() != 0:
         return
@@ -433,13 +473,15 @@ def main():
     tuning = parser.add_mutually_exclusive_group()
     tuning.add_argument('--rank', type=int, default=16)
     tuning.add_argument('--full-block', action='store_true', help='Fine-tune all nine shared layers.')
-    parser.add_argument('--modes', choices=(*MODES, *PROGRESSIVE_MODES), nargs='+', default=MODES)
+    parser.add_argument('--modes', choices=SUPPORTED_MODES, nargs='+', default=MODES)
     parser.add_argument('--train-split', choices=('original', 'disjoint', 'fixed'), default='original')
     parser.add_argument('--evaluate', action='store_true')
     parser.add_argument('--base-ce-model', type=Path, help='Single-pass CE checkpoint to include in evaluation.')
     args = parser.parse_args()
     if args.base_ce_model is not None and not args.evaluate:
         parser.error('--base-ce-model requires --evaluate')
+    if 'consistency' in args.modes and not args.full_block:
+        parser.error('consistency requires --full-block')
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
     if (args.rank < 1 or args.epochs < 1 or args.lr <= 0
             or len(set(args.modes)) != len(args.modes)

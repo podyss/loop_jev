@@ -110,6 +110,17 @@ def main():
     parser.add_argument("--answer-supervision", choices=("every-loop", "final-loop"),
                         default="every-loop",
                         help="Apply answer CE and teacher-logit KL at every loop readout or only the final one")
+    parser.add_argument("--dual-readout-mix", type=float,
+                        help="Label-score weight in fusion CE; initial weight when learning the mix")
+    parser.add_argument("--learn-dual-readout-mix", action="store_true",
+                        help="Train a separate network that predicts a positive fusion weight per example")
+    parser.add_argument("--dual-readout-mix-head", action="store_true",
+                        help="Predict a fusion weight from Qwen's numeric and letter prompt states")
+    parser.add_argument("--dual-readout-mix-learning-rate", type=float, default=5e-3,
+                        help="Learning rate for the per-example fusion network or hidden-state head")
+    parser.add_argument("--direct-answer-head", action="store_true",
+                        help="Use a shared Qwen head to score the actual options in each question")
+    parser.add_argument("--direct-answer-head-learning-rate", type=float, default=3e-4)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--data-parallel-size", type=int, default=1,
                         help="FSDP2 data-parallel size; TP size times DP size must equal torchrun world size")
@@ -159,6 +170,21 @@ def main():
                         help="Seed for selecting training rows; defaults to --seed")
     args = parser.parse_args()
     train_sample_seed = args.seed if args.train_sample_seed is None else args.train_sample_seed
+    use_dual_readout = args.dual_readout_mix is not None
+    if args.direct_answer_head:
+        if use_dual_readout:
+            parser.error("--direct-answer-head cannot be combined with --dual-readout-mix")
+        if not math.isfinite(args.direct_answer_head_learning_rate) or args.direct_answer_head_learning_rate <= 0:
+            parser.error("--direct-answer-head-learning-rate must be finite and positive")
+    if use_dual_readout and (not math.isfinite(args.dual_readout_mix) or args.dual_readout_mix <= 0):
+        parser.error("--dual-readout-mix must be finite and positive")
+    if args.learn_dual_readout_mix and args.dual_readout_mix_head:
+        parser.error("Choose either --learn-dual-readout-mix or --dual-readout-mix-head")
+    if args.learn_dual_readout_mix or args.dual_readout_mix_head:
+        if not use_dual_readout:
+            parser.error("Learning a mix requires --dual-readout-mix as its initial weight")
+        if not math.isfinite(args.dual_readout_mix_learning_rate) or args.dual_readout_mix_learning_rate <= 0:
+            parser.error("--dual-readout-mix-learning-rate must be finite and positive")
     if args.train_sample_seed is not None and args.kv_loss_weight > 0:
         parser.error("An explicit training sample seed is not supported with cached KV targets")
     if args.latent_core_width < 0 or args.latent_core_width % 4:
@@ -353,6 +379,21 @@ def main():
         args.loop_removal_final_rounds == 1 or not 0 < args.loop_removal_final_step <= 1
     ):
         parser.error("A final damping step in (0, 1] requires at least two final rounds")
+    if (use_dual_readout or args.direct_answer_head) and (
+        args.loop_count != 1 or args.loop_damping or args.loop_schedule != "block"
+        or args.answer_supervision != "final-loop" or args.tensor_parallel_size != 1
+        or any((args.latent_slots, args.loop_teacher_model, args.hidden_loss_weight,
+                args.process_loss_weight, args.delta_loss_weight, args.block_state_cache, args.layer_effect_cache,
+                args.progressive_text_weight, args.nonloop_loss_weight, args.suffix_loss_weight, args.kv_loss_weight,
+                args.loop_cot_weight, args.workspace_query_weight, args.workspace_dependency_weight,
+                args.program_composition_weight, args.condition_pair_weight, args.option_workspace,
+                args.transition_rank, args.latent_core_width, args.loop_carry_workspace, args.loop_staged_handoff,
+                args.loop_multiscale_workspace, args.loop_evidence_reread, args.loop_answer_refinement,
+                args.layerwise_depth_supervision, args.loop_removal))
+    ):
+        mode = "The direct answer head" if args.direct_answer_head else "Dual readout"
+        parser.error(f"{mode} requires a single-pass student, no latent slots, and TP=1; "
+                     "it supports answer CE and full-rationale teacher logit loss")
     if args.loop_removal and (
         (args.loop_start_layer, args.loop_end_layer, args.loop_count, args.latent_slots,
          args.loop_damping_step) != (9, 18, 10, 24, 0.1)
@@ -445,6 +486,13 @@ def main():
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DistributedConfig
     from tqdm.auto import tqdm
 
+    if use_dual_readout:
+        from loop_jev.evaluation.option_trie import (
+            combine, make_prompt, mix_head_positions, numeric_token_logprobs, trie_edges, trie_mask,
+        )
+    if args.direct_answer_head:
+        from loop_jev.option_workspace import encode_choice_prompt, pad_option_end_positions
+
     @torch.no_grad()
     def clip_grad_norm_mixed(parameters, max_norm):
         grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
@@ -491,6 +539,7 @@ def main():
         if len(ids) != 1:
             raise ValueError(f"Answer label {label!r} is not one token: {ids}")
         candidate_ids.append(ids[0])
+    dual_candidate_ids = candidate_ids if args.dual_readout_mix_head else candidate_ids[:4]
 
     use_loop_teacher = args.loop_teacher_model is not None
     teacher_config = (AutoConfig.from_pretrained(args.loop_teacher_model, trust_remote_code=False)
@@ -509,12 +558,28 @@ def main():
 
         def __getitem__(self, index):
             row = self.rows[index]
+            if args.direct_answer_head and not 0 <= row["gold_index"] < len(row["options"]):
+                raise ValueError(f"Invalid target for {row['id']}")
+            dual_item = {}
+            if use_dual_readout:
+                option_count = len(row["options"])
+                if not args.dual_readout_mix_head and option_count != 4:
+                    raise ValueError(f"Expected four options for {row['id']}")
+                packed, meta, target = make_prompt(tokenizer, row, tokenizer.pad_token_id, 'cpu',
+                                                   layout='joint-noslots')
+                if packed.size(1) > args.max_length:
+                    raise ValueError(f"Packed length exceeds max length for {row['id']}")
+                dual_item = {"packed": packed, "meta": meta, "target": target, "option_count": option_count}
+                if not args.logit_loss_weight:
+                    return dual_item
             options = "\n".join(
                 f"({label_chars[i]}) {option}" for i, option in enumerate(row["options"])
             )
             user_content = f"Question: {row['question']}\nOptions:\n{options}"
             if use_option_workspace:
                 prompt_ids, option_spans = encode_option_prompt(tokenizer, row)
+            elif args.direct_answer_head:
+                prompt_ids, option_spans = encode_choice_prompt(tokenizer, row)
             elif args.loop_staged_handoff:
                 prompt_ids, option_start = encode_handoff_prompt(tokenizer, row['question'], user_content)
             else:
@@ -566,10 +631,11 @@ def main():
                 "teacher_input_ids": teacher_ids,
                 "target": row["gold_index"],
                 "option_count": len(row["options"]),
+                **dual_item,
             }
             if use_condition_pairs:
                 item["pair_id"] = row.get("pair_id")
-            if use_option_workspace:
+            if use_option_workspace or args.direct_answer_head:
                 item["option_spans"] = option_spans
             if args.loop_staged_handoff:
                 item["handoff_option_start"] = option_start
@@ -616,7 +682,20 @@ def main():
 
     def collate(examples):
         batch = {}
-        names = ["student_input_ids", "teacher_input_ids"]
+        names = ["teacher_input_ids"]
+        if use_dual_readout:
+            width = max(item["packed"].size(1) for item in examples)
+            meta_width = max(item["meta"].size(0) for item in examples)
+            batch.update({
+                "packed": torch.stack([F.pad(item["packed"], (0, width - item["packed"].size(1)))
+                                       for item in examples]),
+                "meta": torch.stack([F.pad(item["meta"], (0, meta_width - item["meta"].size(0)))
+                                     for item in examples]),
+            })
+            if not args.logit_loss_weight:
+                names.clear()
+        else:
+            names.insert(0, "student_input_ids")
         if use_process:
             names += [f"process_{k}_input_ids" for k in range(args.loop_count - 1)]
         for name in names:
@@ -676,9 +755,10 @@ def main():
             if any(a != b for a, b in zip(pair_ids[::2], pair_ids[1::2], strict=True)):
                 raise ValueError("Condition pairs must be adjacent in every batch")
             batch["pair_valid"] = torch.tensor([key is not None for key in pair_ids[::2]])
-        if use_option_workspace:
+        if use_option_workspace or args.direct_answer_head:
             width = batch["student_input_ids"].shape[1]
-            batch["option_spans"] = pad_option_spans(
+            pad_choices = pad_option_end_positions if args.direct_answer_head else pad_option_spans
+            batch["option_locations"] = pad_choices(
                 [item["option_spans"] for item in examples],
                 [width - len(item["student_input_ids"]) for item in examples],
             )
@@ -897,6 +977,12 @@ def main():
     student_config.loop_transition_type = args.transition_type
     student_config.option_workspace = use_option_workspace
     student_config.loop_refinement_token_ids = candidate_ids if args.loop_answer_refinement else None
+    if args.direct_answer_head or hasattr(student_config, "direct_answer_head"):
+        student_config.direct_answer_head = "shared" if args.direct_answer_head else False
+    if args.dual_readout_mix_head:
+        student_config.dual_readout_mix_head_initial = args.dual_readout_mix
+    elif hasattr(student_config, "dual_readout_mix_head_initial"):
+        del student_config.dual_readout_mix_head_initial
     student_config.latent_core_width = args.latent_core_width
     if args.latent_core_width:
         student_config.latent_core_suffix = len(tokenizer.encode("Answer: (", add_special_tokens=False))
@@ -1033,9 +1119,18 @@ def main():
     refinement_parameters = [p for name, p in student.named_parameters()
                              if name.startswith("loop_answer_refinement.")]
     core_parameters = [p for name, p in student.named_parameters() if name.startswith("latent_core.")]
+    direct_answer_parameters = [p for name, p in student.named_parameters()
+                                if name.startswith("direct_answer_head.")]
+    mix_head_parameters = [p for name, p in student.named_parameters()
+                           if name.startswith("dual_readout_mix_head.")]
     base_parameters = [p for name, p in student.named_parameters()
-                       if not name.startswith(("loop_transition.", "loop_answer_refinement.", "latent_core."))]
+                       if not name.startswith(("loop_transition.", "loop_answer_refinement.", "latent_core.",
+                                               "direct_answer_head.", "dual_readout_mix_head."))]
     parameter_groups = [{"params": base_parameters, "lr": args.learning_rate}]
+    if direct_answer_parameters:
+        parameter_groups.append({"params": direct_answer_parameters, "lr": args.direct_answer_head_learning_rate})
+    if mix_head_parameters:
+        parameter_groups.append({"params": mix_head_parameters, "lr": args.dual_readout_mix_learning_rate})
     if use_layer_effect:
         from torch.nn.parallel import DistributedDataParallel
 
@@ -1072,6 +1167,18 @@ def main():
     refinement_learning_rate = 1e-4 if args.loop_answer_refinement else None
     if refinement_parameters:
         parameter_groups.append({"params": refinement_parameters, "lr": refinement_learning_rate})
+    mix_network = None
+    if args.learn_dual_readout_mix:
+        from torch.nn.parallel import DistributedDataParallel
+
+        from loop_jev.dual_readout import DualReadoutMix, MIX_NETWORK_FILENAME
+
+        mix_network = DistributedDataParallel(
+            DualReadoutMix(args.dual_readout_mix).to(local_rank), device_ids=[local_rank],
+        )
+        parameter_groups.append({
+            "params": list(mix_network.parameters()), "lr": args.dual_readout_mix_learning_rate,
+        })
     parameters_for_clipping = [parameter for group in parameter_groups for parameter in group["params"]]
     optimizer = torch.optim.AdamW(parameter_groups, weight_decay=0.01, foreach=False)
     samples_per_rank = len(encoded) // args.data_parallel_size
@@ -1179,14 +1286,28 @@ def main():
                     batch.pop("dependency_input_ids"), batch.pop("dependency_mask"), probe,
                 )
                 dependency_targets = batch.pop("dependency_targets")
-            teacher_batch = {
-                "input_ids": batch.pop("teacher_input_ids"),
-                "attention_mask": batch.pop("teacher_attention_mask"),
-            }
-            student_batch = {
-                "input_ids": batch.pop("student_input_ids"),
-                "attention_mask": batch.pop("student_attention_mask"),
-            }
+            if use_dual_readout:
+                token_ids, positions, branches = batch.pop("packed").unbind(dim=1)
+                meta = batch.pop("meta")
+                student_batch = {
+                    "input_ids": token_ids,
+                    "position_ids": positions,
+                    "attention_mask": {"full_attention": trie_mask(positions, branches)},
+                }
+                readout_positions = torch.cat((meta[:, 3:], meta[:, 2:3]), dim=1)
+                if args.dual_readout_mix_head:
+                    student_batch["mix_head_positions"] = mix_head_positions(meta)
+            else:
+                student_batch = {
+                    "input_ids": batch.pop("student_input_ids"),
+                    "attention_mask": batch.pop("student_attention_mask"),
+                }
+                readout_positions = 1
+            if use_teacher or not use_dual_readout:
+                teacher_batch = {
+                    "input_ids": batch.pop("teacher_input_ids"),
+                    "attention_mask": batch.pop("teacher_attention_mask"),
+                }
             if args.loop_removal:
                 if update_step in removal_stages:
                     rounds, slots = removal_stages.pop(update_step)
@@ -1199,7 +1320,11 @@ def main():
                         print(f"loop_removal {stage}", flush=True)
                 student_batch = trim_workspace(student_batch, slots, removal_suffix, args.latent_slots)
             if use_option_workspace:
-                student_batch["option_spans"] = batch.pop("option_spans")
+                student_batch["option_spans"] = batch.pop("option_locations")
+                student_batch["option_vocab_logits"] = args.logit_loss_weight > 0
+            if args.direct_answer_head:
+                student_batch["direct_answer_scores"] = True
+                student_batch["direct_answer_positions"] = batch.pop("option_locations")
                 student_batch["option_vocab_logits"] = args.logit_loss_weight > 0
             if args.loop_staged_handoff:
                 student_batch["handoff_option_start"] = batch.pop("handoff_option_start")
@@ -1293,7 +1418,7 @@ def main():
                 if args.loop_answer_refinement:
                     dependency_kwargs["refine_answer_scores"] = True
                 student_outputs = student(
-                    **student_batch, logits_to_keep=1, output_hidden_states=False, **dependency_kwargs,
+                    **student_batch, logits_to_keep=readout_positions, output_hidden_states=False, **dependency_kwargs,
                 )
                 if use_layer_effect:
                     layer_effect_loss = effect_readout(
@@ -1337,10 +1462,27 @@ def main():
                     option_logits = student_outputs.logits.masked_fill(~valid_options, float("-inf"))
                     base_options = student_logits[:, candidate_ids].masked_fill(~valid_options, float("-inf"))
                     answer_losses.append(F.cross_entropy(base_options, targets))
-                elif use_option_workspace:
+                elif use_option_workspace or args.direct_answer_head:
                     option_logits = student_outputs.logits.float()
                     if teacher_probs is not None:
                         student_logits = student_outputs.answer_token_logits[:, -1, :].float()
+                elif use_dual_readout:
+                    tokens, _, active = trie_edges(token_ids, branches, meta, len(dual_candidate_ids))
+                    log_probs = numeric_token_logprobs(student_outputs.logits[:, :-1], tokens)
+                    numeric = (log_probs[..., None] * active).sum(dim=1)
+                    letter_logits = student_outputs.logits[:, -1]
+                    labels = letter_logits[:, dual_candidate_ids].float()
+                    if args.dual_readout_mix_head:
+                        mix = student_outputs.mix
+                    elif mix_network is not None:
+                        mix = mix_network(numeric, labels)
+                    else:
+                        mix = args.dual_readout_mix
+                    option_logits = combine(numeric, labels, mix).masked_fill(
+                        ~valid_options[:, :len(dual_candidate_ids)], float("-inf"),
+                    )
+                    if teacher_probs is not None:
+                        student_logits = letter_logits.float()
                 else:
                     student_logits = (
                         student_outputs.logits[:, -1, :].float()
@@ -1668,11 +1810,17 @@ def main():
                               or saved_slots != (args.latent_slots if args.loop_removal_keep_slots else 0)):
         raise RuntimeError("Refusing to export a loop-removal model before the final stage")
     args.output.mkdir(parents=True, exist_ok=True)
+    if mix_network is not None:
+        student_base.config.dual_readout_mix_network_initial = args.dual_readout_mix
+    elif hasattr(student_base.config, "dual_readout_mix_network_initial"):
+        del student_base.config.dual_readout_mix_network_initial
     student.save_pretrained(
         args.output, safe_serialization=True, max_shard_size="5GB",
     )
     if rank == 0:
         tokenizer.save_pretrained(args.output)
+        if mix_network is not None:
+            torch.save(mix_network.module.state_dict(), args.output / MIX_NETWORK_FILENAME)
         if use_query:
             torch.save(query_readout.module.state_dict(), args.output / "workspace_query.pt")
         metadata = {
@@ -1744,6 +1892,7 @@ def main():
             "logit_distillation": (
                 f"temperature-scaled {args.logit_loss_type.upper()} over the full vocabulary "
                 + ("at the undamped first readout's next-answer-token position" if args.loop_answer_refinement else
+                   "at the letter branch's next-answer-token position" if use_dual_readout else
                    "at the final loop readout's next-answer-token position" if args.answer_supervision == "final-loop" else
                    "at every loop readout's next-answer-token position, averaged across loops")
             ),
@@ -1752,6 +1901,9 @@ def main():
             "logit_loss_weight": args.logit_loss_weight,
             "option_workspace": use_option_workspace,
             "answer_loss": (
+                "cross-entropy over numeric sequence log-likelihoods plus weighted answer-letter logits"
+                if use_dual_readout else
+                "cross-entropy over valid options scored by the shared direct answer head" if args.direct_answer_head else
                 "cross-entropy over four option workspace scores" if use_option_workspace else
                 "sum of answer-letter cross-entropies at the direct and refined readouts"
                 if args.loop_answer_refinement else
@@ -1783,7 +1935,9 @@ def main():
             "kv_cache": str(args.kv_cache) if use_kv else None,
             "kv_objective": "cosine alignment of pre-RoPE normalized K and V at latent workspace positions, final loop only" if use_kv else None,
             "nonloop_objective": "same question-only input and full-rationale teacher target as final-loop; weighted CE+KL mixture, sequential backward" if use_nonloop else None,
-            "student_input": (f"question and options, {saved_slots} latent marker tokens, then Answer: ("
+            "student_input": ("trie packing the answer-letter prompt and all candidate numeric answer paths"
+                              if use_dual_readout else
+                              f"question and options, {saved_slots} latent marker tokens, then Answer: ("
                               if saved_slots
                               else "question and options only, followed by Answer: ("),
             "teacher_input": (
@@ -1832,6 +1986,17 @@ def main():
             "max_grad_norm": 1.0,
             "status": "complete",
         }
+        if args.direct_answer_head:
+            metadata["direct_answer_head_learning_rate"] = args.direct_answer_head_learning_rate
+        if args.dual_readout_mix_head or mix_network is not None:
+            if args.dual_readout_mix_head:
+                metadata["dual_readout_mix_source"] = "hidden-state"
+            else:
+                metadata["dual_readout_mix_network"] = MIX_NETWORK_FILENAME
+            metadata["dual_readout_mix_initial"] = args.dual_readout_mix
+            metadata["dual_readout_mix_learning_rate"] = args.dual_readout_mix_learning_rate
+        elif use_dual_readout:
+            metadata["dual_readout_mix"] = args.dual_readout_mix
         (args.output / "experiment.json").write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
         )

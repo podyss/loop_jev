@@ -106,6 +106,8 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
         attn_implementation="sdpa", trust_remote_code=False,
     ).eval()
     option_workspace = getattr(model.config, "option_workspace", False)
+    direct_answer_head = getattr(model.config, "direct_answer_head", False)
+    shared_answer_head = direct_answer_head == "shared"
     refinement_ids = getattr(model.config, "loop_refinement_token_ids", None)
     refinement = bool(refinement_ids) and not args.disable_looping
     if refinement and refinement_ids != candidate_ids:
@@ -113,6 +115,8 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
     handoff = getattr(model.config, "loop_staged_handoff", False) and not args.disable_looping
     if option_workspace:
         from loop_jev.option_workspace import encode_option_prompt, pad_option_spans
+    if shared_answer_head:
+        from loop_jev.option_workspace import encode_choice_prompt, pad_option_end_positions
     if not args.disable_looping or option_workspace:
         from loop_jev.looping import enable_configured_looping
         enable_configured_looping(model, use_transition=not args.disable_transition,
@@ -125,8 +129,9 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
               position=rank or 0) as progress:
         for start in range(0, len(rows), args.batch_size):
             batch_rows = rows[start:start + args.batch_size]
-            if option_workspace:
-                encoded = [encode_option_prompt(tokenizer, row) for row in batch_rows]
+            if option_workspace or shared_answer_head:
+                encode_choices = encode_choice_prompt if shared_answer_head else encode_option_prompt
+                encoded = [encode_choices(tokenizer, row) for row in batch_rows]
                 suffix = tokenizer.encode("Answer: (", add_special_tokens=False)
                 prompts = [ids + [args._latent_marker_token_id] * args._latent_slots + suffix for ids, _ in encoded]
             elif handoff:
@@ -142,6 +147,12 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
                 option_kwargs["disable_evidence_reread"] = True
             if refinement:
                 option_kwargs["refine_answer_scores"] = True
+            if direct_answer_head:
+                option_kwargs["direct_answer_scores"] = True
+            if shared_answer_head:
+                option_kwargs["direct_answer_positions"] = pad_option_end_positions(
+                    [spans for _, spans in encoded], [max_length - len(ids) for ids in prompts],
+                ).to(device)
             if option_workspace:
                 option_kwargs["option_spans"] = pad_option_spans(
                     [spans for _, spans in encoded], [max_length - len(ids) for ids in prompts],
@@ -168,7 +179,8 @@ def score_transformers(args, rows, tokenizer, candidate_ids):
                     use_cache=False,
                     **option_kwargs,
                 ).logits
-            scores = (logits if option_workspace or refinement else logits[:, -1, candidate_ids]).float().cpu()
+            scores = (logits if option_workspace or refinement or direct_answer_head
+                      else logits[:, -1, candidate_ids]).float().cpu()
             for row, row_scores in zip(batch_rows, scores):
                 yield row, row_scores[:len(row["options"])]
             progress.update(len(batch_rows))
@@ -322,6 +334,11 @@ def main():
         args.backend != "transformers" or any(len(row["options"]) != 4 for row in rows)
     ):
         parser.error("Option workspace checkpoints require --backend transformers and four choices per row")
+    direct_answer_head = getattr(config, "direct_answer_head", False)
+    if direct_answer_head and args.backend != "transformers":
+        parser.error("Direct answer head checkpoints require --backend transformers")
+    if direct_answer_head is True and any(len(row["options"]) != 4 for row in rows):
+        parser.error("This fixed-width checkpoint requires four choices per row")
     if args.loop_readout_round is not None and (getattr(config, "loop_count", 1) < 2
                                                 or args.loop_readout_round > config.loop_count):
         parser.error("--loop-readout-round requires a looped checkpoint and cannot exceed its trained rounds")
@@ -364,6 +381,7 @@ def main():
             **row,
             "model": args.model,
             "backend": args.backend,
+            **({"readout": "direct-answer-head"} if direct_answer_head else {}),
             "dtype": args.dtype,
             "disable_looping": args.disable_looping,
             **({"latent_slots": 0} if args.disable_latent_slots else {}),

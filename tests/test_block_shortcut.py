@@ -3,8 +3,8 @@ import unittest
 import torch
 
 from loop_jev.evaluation.block_shortcut import (
-    DIRECT, FIRST, SECOND, IntervalLinear, advance, choose_train_rows, predict_direct, rollout_states,
-    teacher_states, two_hop_predictor,
+    DIRECT, FIRST, SECOND, IntervalLinear, advance, advance_rounds, choose_train_rows, predict_direct,
+    rollout_states, teacher_states, two_hop_predictor,
 )
 
 
@@ -41,6 +41,17 @@ class BlockShortcutTests(unittest.TestCase):
         base = ConstantBlock(torch.randn(2, 4, 8))
         predict_direct(base, None, None)
         self.assertEqual(base.calls, [(9, 18)])
+
+    def test_consistency_uses_adjacent_teacher_states_and_an_identity_endpoint(self):
+        before = torch.ones(2, 4, 8)
+        base = ConstantBlock(before)
+        trajectory = teacher_states(base, before, None, rounds=tuple(range(11)))
+        self.assertEqual(len(trajectory), 11)
+        self.assertIs(trajectory[0], before)
+        torch.testing.assert_close(advance_rounds(base, trajectory[9], None, 1), trajectory[10])
+        base.calls.clear()
+        self.assertIs(advance_rounds(base, trajectory[10], None, 0), trajectory[10])
+        self.assertEqual(base.calls, [])
 
     def test_two_hop_predictor_applies_both_merged_intervals_in_order(self):
         selected = []

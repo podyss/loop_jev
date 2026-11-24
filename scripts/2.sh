@@ -34,6 +34,30 @@ uv run python -m loop_jev.data.shared_train \
   --source "$TRAIN_POOL" --test "$TEST" --output "$TRAIN" --teacher "$LOOP_TEACHER_MODEL"
 
 
+# CE baseline
+HF_ENDPOINT=https://hf-mirror.com OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+uv run torchrun --standalone --nproc_per_node=4 \
+  --module loop_jev.training.answer_slot_distill \
+  --model Qwen/Qwen3-1.7B \
+  --train outputs/jev-repro/train-1024.jsonl \
+  --output outputs/jev-repro/base-ce \
+  --epochs 3 --learning-rate 2e-6 --batch-size 4 \
+  --gradient-accumulation-steps 1 \
+  --max-length 16384 --max-train-examples 1024 \
+  --seed 42 --train-sample-seed 42 \
+  --answer-supervision final-loop --latent-slots 0 \
+  --loop-count 1 --no-loop-damping \
+  --logit-loss-weight 0 --hidden-loss-weight 0 --process-loss-weight 0 \
+  --tensor-parallel-size 1 --data-parallel-size 4
+
+HF_ENDPOINT=https://hf-mirror.com OMP_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0,1,2,3 \
+uv run python -m loop_jev.evaluation.zero_shot \
+  --model outputs/jev-repro/base-ce \
+  --input data/gsm-mc/test.jsonl \
+  --output outputs/jev-repro/base-ce/eval/gsm-mc-test.jsonl \
+  --backend transformers --data-parallel-size 4 --batch-size 4 \
+  --disable-looping
+
 # 1. 训练十轮共享块教师。
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" \
 uv run torchrun --standalone --nproc_per_node="$TRAIN_PROCS" \
